@@ -3,7 +3,6 @@ import requests
 import pandas as pd
 import time
 import io
-import re
 
 try:
     from serpapi import GoogleSearch as SerpApiGoogleSearch
@@ -32,7 +31,7 @@ st.sidebar.header("API configuration")
 if app_mode == "Web of Science":
     st.sidebar.info("⬇️ Enter your **WOS API key** below to get started.")
 elif app_mode == "Scopus":
-    st.sidebar.info("⬇️ Enter your **Scopus API key** and **institutional token** below to get started.")
+    st.sidebar.info("⬇️ Enter your **Scopus/Elsevier API key** and **institutional token** for citation metrics by DOI.")
 else:
     st.sidebar.info("⬇️ Enter your **SerpAPI key** below to get started.")
 
@@ -173,72 +172,69 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
     return results
 
 # ==========================================
-# HELPER FUNCTIONS (SCOPUS)
+# HELPER FUNCTIONS (SCOPUS – Elsevier Citation Metrics by DOI)
 # ==========================================
-def clean_issn(issn_str):
-    # Strip whitespace and hyphens, uppercase
-    cleaned = re.sub(r'[-\s]', '', issn_str.upper())
-    if len(cleaned) == 8:
-        return cleaned
-    return None
+def fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False):
+    """Fetches data from the Elsevier Abstract Citations API."""
+    url = f"https://api.elsevier.com/content/abstract/citations?doi={doi}&apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json"
+    if exclude_self:
+        url += "&citation=exclude-self"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.json()
+    elif response.status_code == 429:
+        time.sleep(2)
+        return fetch_elsevier_citations(doi, api_key, inst_token, exclude_self)
+    else:
+        response.raise_for_status()
 
-def fetch_scopus_data(issns, progress_bar, status_text):
-    results = []
-    total = len(issns)
 
-    base_url = "https://api.elsevier.com/content/serial/title/issn/"
+def process_doi_scopus(doi, api_key, inst_token):
+    """Processes a single DOI to get both metadata and citation metrics."""
+    try:
+        data_total = fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False)
+        cite_header = data_total.get("abstract-citations-response", {}).get("citeColumnTotalXML", {}).get("citeCountHeader", {})
+        total_citations = cite_header.get("grandTotal", 0)
+        cite_info = data_total.get("abstract-citations-response", {}).get("citeInfoMatrix", {}).get("citeInfoMatrixXML", {}).get("citationMatrix", {}).get("citeInfo", [])
+        if isinstance(cite_info, list) and len(cite_info) > 0:
+            article_data = cite_info[0]
+        else:
+            article_data = cite_info if isinstance(cite_info, dict) else {}
+        title = article_data.get("dc:title", "Title not available")
+        pub_type = article_data.get("citationType", {}).get("$", "Type not available") if isinstance(article_data.get("citationType"), dict) else "Type not available"
+        year = article_data.get("sort-year", "Year not available")
 
-    for i, issn in enumerate(issns):
-        status_text.text(f"Fetching ISSN {i+1} of {total}: {issn}...")
-        url = f"{base_url}{issn}?apiKey={SCOPUS_API_KEY}&insttoken={SCOPUS_INST_TOKEN}&httpAccept=application/json"
+        data_exclude = fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=True)
+        cite_header_ex = data_exclude.get("abstract-citations-response", {}).get("citeColumnTotalXML", {}).get("citeCountHeader", {})
+        exclude_self_citations = cite_header_ex.get("grandTotal", 0)
 
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                try:
-                    entry = data['serial-metadata-response']['entry'][0]
+        return {
+            "DOI": doi,
+            "Title": title,
+            "Year": year,
+            "Type": pub_type,
+            "Total Citations": total_citations,
+            "Non-Self Citations": exclude_self_citations,
+            "Status": "Success",
+        }
+    except Exception as e:
+        return {
+            "DOI": doi,
+            "Title": "Error",
+            "Year": "N/A",
+            "Type": "N/A",
+            "Total Citations": "0",
+            "Non-Self Citations": "0",
+            "Status": (str(e)[:50] + "..."),
+        }
 
-                    # Safe extraction of nested data (API may return strings or odd types)
-                    subject_list = entry.get('subject-area', []) or []
-                    subject_areas = [s.get('$', '') for s in subject_list if isinstance(s, dict)]
-                    snip_list = entry.get('SNIPList') if isinstance(entry.get('SNIPList'), dict) else {}
-                    snip_items = snip_list.get('SNIP', []) if isinstance(snip_list.get('SNIP'), list) else []
-                    snip = snip_items[0].get('$', 'N/A') if snip_items and isinstance(snip_items[0], dict) else 'N/A'
-                    sjr_list = entry.get('SJRList') if isinstance(entry.get('SJRList'), dict) else {}
-                    sjr_items = sjr_list.get('SJR', []) if isinstance(sjr_list.get('SJR'), list) else []
-                    sjr = sjr_items[0].get('$', 'N/A') if sjr_items and isinstance(sjr_items[0], dict) else 'N/A'
-                    c_info = entry.get('citeScoreYearInfoList') if isinstance(entry.get('citeScoreYearInfoList'), dict) else {}
-                    c_score = c_info.get('citeScoreCurrentMetric', 'N/A')
 
-                    results.append({
-                        "Journal Title": entry.get('dc:title', 'N/A'),
-                        "Publisher": entry.get('dc:publisher', 'N/A'),
-                        "Print ISSN": entry.get('prism:issn', 'N/A'),
-                        "eISSN": entry.get('prism:eIssn', 'N/A'),
-                        "CiteScore": c_score,
-                        "SNIP": snip,
-                        "SJR": sjr,
-                        "Subject Areas": "; ".join(subject_areas),
-                        "Aggregation Type": entry.get('prism:aggregationType', 'N/A'),
-                        "Queried ISSN": issn,
-                        "Status": "Success"
-                    })
-                except (KeyError, IndexError):
-                    results.append({"Queried ISSN": issn, "Status": "No journal data found"})
-            elif response.status_code == 429:
-                status_text.text(f"Rate limit hit at {issn}. Sleeping 3s...")
-                time.sleep(3)
-            else:
-                results.append({"Queried ISSN": issn, "Status": f"Failed (Code: {response.status_code})"})
-
-        except Exception as e:
-            results.append({"Queried ISSN": issn, "Status": f"Error: {str(e)}"})
-
-        progress_bar.progress((i + 1) / total)
-        time.sleep(0.6)  # Approx 100 requests / minute max
-
-    return results
+def extract_dois_from_df(df):
+    """Finds a DOI column in a dataframe and extracts the values."""
+    doi_col = next((col for col in df.columns if "doi" in str(col).lower()), None)
+    if doi_col:
+        return [str(val).strip() for val in df[doi_col] if str(val).strip().startswith("10.")]
+    return []
 
 # ==========================================
 # GOOGLE SCHOLAR (SerpAPI) – full result or citation only
@@ -406,38 +402,94 @@ if app_mode == "Web of Science":
             )
 
 elif app_mode == "Scopus":
-    st.title("Scopus Institutional Journal Lookup")
-    st.markdown("Fetch journal metrics (CiteScore, SNIP, SJR) using ISSNs.")
+    st.title("Citation Metrics Finder")
+    st.markdown("Discover citation metrics for research articles using Digital Object Identifiers (DOIs). Powered by Elsevier.")
 
-    raw_issn_text = st.text_area("Enter ISSN Numbers (One per line):", height=200, placeholder="2161-797X\n1755-0645")
+    tab1, tab2 = st.tabs(["Single Article", "Bulk Processing"])
 
-    _c1, _c2, _c3 = st.columns([1, 1, 1])
-    with _c2:
-        _scopus_clicked = st.button("🔍 Search Scopus", type="primary", use_container_width=True)
-    if _scopus_clicked:
-        raw_lines = [line.strip() for line in raw_issn_text.split('\n') if line.strip()]
-        clean_issns = [clean_issn(issn) for issn in raw_lines if clean_issn(issn)]
+    with tab1:
+        st.subheader("Search a Single DOI")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            doi_input = st.text_input("Enter article DOI:", placeholder="e.g., 10.5194/bg-18-2755-2021", key="scopus_doi_input")
+        with col2:
+            st.write("")
+            st.write("")
+            search_btn = st.button("Search", type="primary", use_container_width=True, key="scopus_single_btn")
+        st.caption("Examples: `10.5194/bg-18-2755-2021` | `10.3389/fmars.2021.615929` | `10.1038/s41586-020-2008-3`")
 
-        if not clean_issns:
-            st.warning("Please enter valid ISSNs.")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        if search_btn and doi_input:
+            if not doi_input.strip().startswith("10."):
+                st.error("Please enter a valid DOI (should start with '10.')")
+            else:
+                with st.spinner("Retrieving citation data from Elsevier API..."):
+                    result = process_doi_scopus(doi_input.strip(), SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                    if result["Status"] == "Success":
+                        st.success("Article located successfully!")
+                        st.markdown(f"### {result['Title']}")
+                        m_col1, m_col2, m_col3 = st.columns(3)
+                        m_col1.metric("Publication Type", result["Type"])
+                        m_col2.metric("Publication Year", result["Year"])
+                        m_col3.metric("DOI", result["DOI"])
+                        st.divider()
+                        c_col1, c_col2 = st.columns(2)
+                        with c_col1:
+                            st.metric("Total Citations", result["Total Citations"], help="Includes all citations to this research article")
+                        with c_col2:
+                            st.metric("Non-Self Citations", result["Non-Self Citations"], help="Citations from other researchers only")
+                    else:
+                        st.error(f"Failed to fetch data: {result['Status']}")
 
-            scopus_data = fetch_scopus_data(clean_issns, progress_bar, status_text)
+    with tab2:
+        st.subheader("Process Multiple DOIs")
+        st.markdown("##### 1. Paste DOIs")
+        raw_dois = st.text_area("Enter one DOI per line:", height=150, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
+        st.markdown("##### 2. Or Upload a File (.csv, .xlsx)")
+        uploaded_file = st.file_uploader("Upload a spreadsheet containing a 'DOI' column", type=["csv", "xlsx", "xls"], key="scopus_upload")
 
-            status_text.success(f"✅ Finished processing {len(scopus_data)} records!")
-            df_scopus = pd.DataFrame(scopus_data)
+        if st.button("Process Bulk DOIs", type="primary", key="scopus_bulk_btn"):
+            text_dois = [d.strip() for d in raw_dois.split("\n") if d.strip().startswith("10.")]
+            file_dois = []
+            if uploaded_file is not None:
+                try:
+                    if uploaded_file.name.endswith(".csv"):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+                    file_dois = extract_dois_from_df(df)
+                except Exception as e:
+                    st.error(f"Error reading file: {e}")
+            all_dois = list(set(text_dois + file_dois))
 
-            st.dataframe(df_scopus)  # Preview
-
-            excel_data = to_excel(df_scopus)
-            st.download_button(
-                label="📥 Download Scopus Excel File",
-                data=excel_data,
-                file_name="scopus_journal_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            if not all_dois:
+                st.warning("No valid DOIs found. Please ensure they start with '10.'")
+            else:
+                st.info(f"Processing {len(all_dois)} unique DOIs...")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                results_list = []
+                sleep_time = 1.25
+                for i, doi in enumerate(all_dois):
+                    status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
+                    result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                    results_list.append(result)
+                    progress_bar.progress((i + 1) / len(all_dois))
+                    time.sleep(sleep_time)
+                status_text.success("Bulk processing complete!")
+                df_results = pd.DataFrame(results_list)
+                df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Non-Self Citations", "Status"]]
+                st.dataframe(df_results, use_container_width=True)
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    df_results.to_excel(writer, index=False, sheet_name="Citation Results")
+                excel_data = output.getvalue()
+                st.download_button(
+                    label="Download Results (.xlsx)",
+                    data=excel_data,
+                    file_name="citation_metrics_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="scopus_download_btn",
+                )
 
 elif app_mode == "Google Scholar":
     st.title("Google Scholar Citation Lookup")
