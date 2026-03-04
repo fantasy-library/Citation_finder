@@ -64,19 +64,25 @@ else:
     SCOPUS_API_KEY = ""
     SCOPUS_INST_TOKEN = _default_inst_token or ""
 
-# Require at least the credentials for the selected mode (no need to enter all)
+# Unlock search view only when API key (and token for Scopus) is entered
 if app_mode == "Google Scholar":
-    if not SERPAPI_KEY or not SERPAPI_KEY.strip():
-        st.sidebar.warning("Please enter your SerpAPI key for Google Scholar.")
-        st.stop()
+    api_unlocked = bool(SERPAPI_KEY and SERPAPI_KEY.strip())
+    api_reminder = "Please enter your SerpAPI key in the sidebar to unlock the search."
 elif app_mode == "Web of Science":
-    if not WOS_API_KEY or not WOS_API_KEY.strip():
-        st.sidebar.warning("Please enter your WOS API key to use Web of Science.")
-        st.stop()
+    api_unlocked = bool(WOS_API_KEY and WOS_API_KEY.strip())
+    api_reminder = "Please enter your API key in the sidebar to unlock the search."
 elif app_mode == "Scopus":
-    if not SCOPUS_API_KEY or not SCOPUS_API_KEY.strip() or not SCOPUS_INST_TOKEN or not SCOPUS_INST_TOKEN.strip():
-        st.sidebar.warning("Please enter your Scopus API key and institutional token to use Scopus.")
-        st.stop()
+    api_unlocked = bool(
+        SCOPUS_API_KEY and SCOPUS_API_KEY.strip()
+        and SCOPUS_INST_TOKEN and SCOPUS_INST_TOKEN.strip()
+    )
+    api_reminder = "Please enter your Scopus API key and institutional token in the sidebar to unlock the search."
+else:
+    api_unlocked = False
+    api_reminder = "Please enter your API key in the sidebar to unlock the search."
+
+if not api_unlocked:
+    st.sidebar.warning("Please enter your API key to unlock the search view.")
 
 # ==========================================
 # API ERROR MESSAGES (user-friendly)
@@ -464,142 +470,174 @@ st.markdown("""
 st.sidebar.markdown("---")
 st.sidebar.caption("🔐 Enter only the API key(s) for the selected database. Keys are not stored on disk.")
 
+
+def _title_with_icon(icon_filename, title_text):
+    """Render page title with icon from icons folder."""
+    icon_path = _icons_dir / icon_filename
+    if icon_path.exists():
+        col_icon, col_title = st.columns([0.08, 0.92])
+        with col_icon:
+            st.image(str(icon_path), use_container_width=True)
+        with col_title:
+            st.title(title_text)
+    else:
+        st.title(title_text)
+
+
+def _locked_view(icon_filename, reminder_message):
+    """Show locked state: icon + reminder to enter API key."""
+    st.markdown("<br>", unsafe_allow_html=True)
+    icon_path = _icons_dir / icon_filename
+    if icon_path.exists():
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c2:
+            st.image(str(icon_path), width=100)
+    st.info(f"🔒 **{reminder_message}**")
+    st.caption("Enter your API key in the **sidebar** to unlock the search view.")
+
+
 if app_mode == "Web of Science":
-    st.title("📚 Web of Science citation finder")
+    _title_with_icon("WoS.png", "Web of Science citation finder")
     st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
 
-    raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
+    if not api_unlocked:
+        _locked_view("WoS.png", "Please enter your API key")
+    else:
+        raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
 
-    _c1, _c2, _c3 = st.columns([1, 1, 1])
-    with _c2:
-        _wos_clicked = st.button("🔍 Search Web of Science", type="primary", use_container_width=True)
+        _c1, _c2, _c3 = st.columns([1, 1, 1])
+        with _c2:
+            _wos_clicked = st.button("🔍 Search Web of Science", type="primary", use_container_width=True)
 
-    if _wos_clicked:
-        wos_ids = [line.strip() for line in raw_wos_text.split('\n') if line.strip()]
-        if wos_ids and "unique wos id" in wos_ids[0].lower():
-            wos_ids.pop(0)  # remove header if pasted
+        if _wos_clicked:
+            wos_ids = [line.strip() for line in raw_wos_text.split('\n') if line.strip()]
+            if wos_ids and "unique wos id" in wos_ids[0].lower():
+                wos_ids.pop(0)  # remove header if pasted
 
-        if not wos_ids:
-            st.warning("Please enter valid WOS IDs.")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            if not wos_ids:
+                st.warning("Please enter valid WOS IDs.")
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-            wos_data = fetch_wos_data(wos_ids, progress_bar, status_text)
+                wos_data = fetch_wos_data(wos_ids, progress_bar, status_text)
 
-            success_count = sum(1 for r in wos_data if r.get("Status") == "Success")
-            status_text.success(f"✅ Finished processing {len(wos_data)} records!")
-            if success_count == 0:
-                st.warning("**Cannot find DOI — no documents could be found.** Please check your WOS IDs (format like `WOS:001681025100006`) and that your API key has access to these documents.")
-            df_wos = pd.DataFrame(wos_data)
-            st.session_state["wos_df"] = df_wos
+                success_count = sum(1 for r in wos_data if r.get("Status") == "Success")
+                status_text.success(f"✅ Finished processing {len(wos_data)} records!")
+                if success_count == 0:
+                    st.warning("**Cannot find DOI — no documents could be found.** Please check your WOS IDs (format like `WOS:001681025100006`) and that your API key has access to these documents.")
+                df_wos = pd.DataFrame(wos_data)
+                st.session_state["wos_df"] = df_wos
 
-    # Show stored WOS results and optional Google Scholar citations
-    if "wos_df" in st.session_state:
-        df_show = st.session_state["wos_df"]
-        _gs_clicked = False
-        if SERPAPI_KEY and SERPAPI_KEY.strip():
-            st.markdown("---")
-            st.subheader("📊 Enrich with Google Scholar")
-            _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
-            with _gc2:
-                _gs_clicked = st.button("🎓 Add Google Scholar citations", type="secondary", use_container_width=True)
-        elif not SERPAPI_AVAILABLE:
-            st.sidebar.caption("Install `google-search-results` for Google Scholar: pip install google-search-results")
-        else:
-            st.caption("Add a SerpAPI key in the sidebar to fetch Google Scholar citation counts by DOI.")
+        # Show stored WOS results and optional Google Scholar citations
+        if "wos_df" in st.session_state:
+            df_show = st.session_state["wos_df"]
+            _gs_clicked = False
+            if SERPAPI_KEY and SERPAPI_KEY.strip():
+                st.markdown("---")
+                st.subheader("📊 Enrich with Google Scholar")
+                _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
+                with _gc2:
+                    _gs_clicked = st.button("🎓 Add Google Scholar citations", type="secondary", use_container_width=True)
+            elif not SERPAPI_AVAILABLE:
+                st.sidebar.caption("Install `google-search-results` for Google Scholar: pip install google-search-results")
+            else:
+                st.caption("Add a SerpAPI key in the sidebar to fetch Google Scholar citation counts by DOI.")
 
-        if _gs_clicked and SERPAPI_KEY and SERPAPI_KEY.strip() and SERPAPI_AVAILABLE:
-            dois = df_show["DOI"].astype(str).tolist()
-            total = len(dois)
-            progress_gs = st.progress(0)
-            status_gs = st.empty()
-            gs_citations = []
-            for i, doi in enumerate(dois):
-                status_gs.text(f"Google Scholar {i+1}/{total}: {doi[:40]}...")
-                cnt = fetch_google_scholar_citation(doi, SERPAPI_KEY)
-                gs_citations.append(cnt if cnt is not None else "N/A")
-                progress_gs.progress((i + 1) / total)
-                time.sleep(0.3)
-            status_gs.success("✅ Google Scholar citations added.")
-            df_show = df_show.copy()
-            df_show["Google Scholar citations"] = gs_citations
-            st.session_state["wos_df"] = df_show
+            if _gs_clicked and SERPAPI_KEY and SERPAPI_KEY.strip() and SERPAPI_AVAILABLE:
+                dois = df_show["DOI"].astype(str).tolist()
+                total = len(dois)
+                progress_gs = st.progress(0)
+                status_gs = st.empty()
+                gs_citations = []
+                for i, doi in enumerate(dois):
+                    status_gs.text(f"Google Scholar {i+1}/{total}: {doi[:40]}...")
+                    cnt = fetch_google_scholar_citation(doi, SERPAPI_KEY)
+                    gs_citations.append(cnt if cnt is not None else "N/A")
+                    progress_gs.progress((i + 1) / total)
+                    time.sleep(0.3)
+                status_gs.success("✅ Google Scholar citations added.")
+                df_show = df_show.copy()
+                df_show["Google Scholar citations"] = gs_citations
+                st.session_state["wos_df"] = df_show
 
-        if "Google Scholar citations" in df_show.columns or not _gs_clicked:
-            st.dataframe(st.session_state["wos_df"], use_container_width=True)
-            excel_data = to_excel(st.session_state["wos_df"])
+            if "Google Scholar citations" in df_show.columns or not _gs_clicked:
+                st.dataframe(st.session_state["wos_df"], use_container_width=True)
+                excel_data = to_excel(st.session_state["wos_df"])
+                st.download_button(
+                    label="📥 Download results (.xlsx)",
+                    data=excel_data,
+                    file_name="wos_bulk_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="wos_download_btn",
+                )
+
+elif app_mode == "Scopus":
+    _title_with_icon("Scopus.png", "Scopus Citation Metrics Finder")
+    st.markdown("Fetch **citation metrics** (total and exclude self-citations) for articles using DOIs. Paste DOIs or upload a file.")
+
+    if not api_unlocked:
+        _locked_view("Scopus.png", "Please enter your API key")
+    else:
+        raw_dois = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
+        uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
+
+        _c1, _c2, _c3 = st.columns([1, 1, 1])
+        with _c2:
+            _scopus_clicked = st.button("🔍 Search Scopus", type="primary", use_container_width=True, key="scopus_bulk_btn")
+
+        if _scopus_clicked:
+            text_dois = [d.strip() for d in raw_dois.split("\n") if d.strip().startswith("10.")]
+            file_dois = []
+            if uploaded_file is not None:
+                try:
+                    if uploaded_file.name.endswith(".csv"):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+                    file_dois = extract_dois_from_df(df)
+                except Exception as e:
+                    st.error(f"Error reading file: {e}")
+            all_dois = list(set(text_dois + file_dois))
+
+            if not all_dois:
+                st.warning("No valid DOIs found. Please ensure they start with '10.'")
+            else:
+                st.info(f"Processing {len(all_dois)} unique DOIs...")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                results_list = []
+                sleep_time = 1.25
+                for i, doi in enumerate(all_dois):
+                    status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
+                    result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                    results_list.append(result)
+                    progress_bar.progress((i + 1) / len(all_dois))
+                    time.sleep(sleep_time)
+                status_text.success(f"✅ Finished processing {len(results_list)} records!")
+                df_results = pd.DataFrame(results_list)
+                df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Exclude self-citations", "Status"]]
+                st.session_state["scopus_df"] = df_results
+
+        if "scopus_df" in st.session_state:
+            st.dataframe(st.session_state["scopus_df"], use_container_width=True)
+            excel_data = to_excel(st.session_state["scopus_df"])
             st.download_button(
                 label="📥 Download results (.xlsx)",
                 data=excel_data,
-                file_name="wos_bulk_results.xlsx",
+                file_name="scopus_citation_results.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="wos_download_btn",
+                key="scopus_download_btn",
             )
 
-elif app_mode == "Scopus":
-    st.title("📈 Scopus Citation Metrics Finder")
-    st.markdown("Fetch **citation metrics** (total and non-self) for articles using DOIs. Paste DOIs or upload a file.")
-
-    raw_dois = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
-    uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
-
-    _c1, _c2, _c3 = st.columns([1, 1, 1])
-    with _c2:
-        _scopus_clicked = st.button("🔍 Search Scopus", type="primary", use_container_width=True, key="scopus_bulk_btn")
-
-    if _scopus_clicked:
-        text_dois = [d.strip() for d in raw_dois.split("\n") if d.strip().startswith("10.")]
-        file_dois = []
-        if uploaded_file is not None:
-            try:
-                if uploaded_file.name.endswith(".csv"):
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
-                file_dois = extract_dois_from_df(df)
-            except Exception as e:
-                st.error(f"Error reading file: {e}")
-        all_dois = list(set(text_dois + file_dois))
-
-        if not all_dois:
-            st.warning("No valid DOIs found. Please ensure they start with '10.'")
-        else:
-            st.info(f"Processing {len(all_dois)} unique DOIs...")
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            results_list = []
-            sleep_time = 1.25
-            for i, doi in enumerate(all_dois):
-                status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
-                result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
-                results_list.append(result)
-                progress_bar.progress((i + 1) / len(all_dois))
-                time.sleep(sleep_time)
-            status_text.success(f"✅ Finished processing {len(results_list)} records!")
-            df_results = pd.DataFrame(results_list)
-            df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Exclude self-citations", "Status"]]
-            st.session_state["scopus_df"] = df_results
-
-    if "scopus_df" in st.session_state:
-        st.dataframe(st.session_state["scopus_df"], use_container_width=True)
-        excel_data = to_excel(st.session_state["scopus_df"])
-        st.download_button(
-            label="📥 Download results (.xlsx)",
-            data=excel_data,
-            file_name="scopus_citation_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="scopus_download_btn",
-        )
-
 elif app_mode == "Google Scholar":
-    st.title("🎓 Google Scholar Citation Lookup")
+    _title_with_icon("Google.png", "Google Scholar Citation Lookup")
     st.markdown("Fetch **citation counts** by DOI using SerpAPI. Paste one DOI per line.")
 
-    if not SERPAPI_AVAILABLE:
+    if not api_unlocked:
+        _locked_view("Google.png", "Please enter your API key")
+    elif not SERPAPI_AVAILABLE:
         st.warning("⚠️ Install the SerpAPI client: **pip install google-search-results**")
-    elif not SERPAPI_KEY or not SERPAPI_KEY.strip():
-        st.info("🔑 Enter your **SerpAPI key** in the sidebar to use Google Scholar search.")
     else:
         raw_doi_text = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.1038/s41593-021-00969-4\n10.1109/TMI.2025.3605219")
 
