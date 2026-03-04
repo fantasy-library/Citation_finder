@@ -31,37 +31,28 @@ app_mode = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.header("🔑 API configuration")
 
-# Highlight which key(s) to enter for the selected mode
+# Show only the API key field(s) for the selected database
 if app_mode == "Web of Science":
     st.sidebar.info("⬇️ Enter your **WOS API key** below to get started.")
+    WOS_API_KEY = st.sidebar.text_input("WOS API key", type="password", placeholder="Your WOS API key")
+    SCOPUS_API_KEY = ""
+    SCOPUS_INST_TOKEN = _default_inst_token or ""
+    SERPAPI_KEY = ""
 elif app_mode == "Scopus":
-    st.sidebar.info("⬇️ Enter your **Scopus/Elsevier API key** and **institutional token** for citation metrics by DOI.")
+    st.sidebar.info("⬇️ Enter your **Scopus API key** and **institutional token** below.")
+    SCOPUS_API_KEY = st.sidebar.text_input("Scopus API key", type="password", placeholder="Your Scopus API key")
+    if _default_inst_token:
+        SCOPUS_INST_TOKEN = _default_inst_token
+    else:
+        SCOPUS_INST_TOKEN = st.sidebar.text_input("Scopus institutional token", type="password", placeholder="Your institutional token")
+    WOS_API_KEY = ""
+    SERPAPI_KEY = ""
 else:
     st.sidebar.info("⬇️ Enter your **SerpAPI key** below to get started.")
-
-WOS_API_KEY = st.sidebar.text_input(
-    "WOS API key",
-    type="password",
-    placeholder="Required for Web of Science" if app_mode == "Web of Science" else "",
-)
-SCOPUS_API_KEY = st.sidebar.text_input(
-    "Scopus API key",
-    type="password",
-    placeholder="Required for Scopus" if app_mode == "Scopus" else "",
-)
-if _default_inst_token:
-    SCOPUS_INST_TOKEN = _default_inst_token  # hidden: use from secrets, no field shown
-else:
-    SCOPUS_INST_TOKEN = st.sidebar.text_input(
-        "Scopus institutional token",
-        type="password",
-        placeholder="Required for Scopus" if app_mode == "Scopus" else "",
-    )
-SERPAPI_KEY = st.sidebar.text_input(
-    "SerpAPI key",
-    type="password",
-    placeholder="Required for Google Scholar" if app_mode == "Google Scholar" else "",
-)
+    SERPAPI_KEY = st.sidebar.text_input("SerpAPI key", type="password", placeholder="Your SerpAPI key")
+    WOS_API_KEY = ""
+    SCOPUS_API_KEY = ""
+    SCOPUS_INST_TOKEN = _default_inst_token or ""
 
 # Require at least the credentials for the selected mode (no need to enter all)
 if app_mode == "Google Scholar":
@@ -76,6 +67,41 @@ elif app_mode == "Scopus":
     if not SCOPUS_API_KEY or not SCOPUS_API_KEY.strip() or not SCOPUS_INST_TOKEN or not SCOPUS_INST_TOKEN.strip():
         st.sidebar.warning("Please enter your Scopus API key and institutional token to use Scopus.")
         st.stop()
+
+# ==========================================
+# API ERROR MESSAGES (user-friendly)
+# ==========================================
+def api_error_message(service, status_code, response_body=None):
+    """Return a short user-facing message for API errors."""
+    body = (response_body or "").lower() if isinstance(response_body, str) else ""
+    if status_code == 400:
+        return "Bad request — check your query or identifier format."
+    if status_code == 401:
+        return "Invalid or missing API key. Check your credentials."
+    if status_code == 403:
+        return "Access denied. API key may be invalid or lack permission."
+    if status_code == 404:
+        return "Not found — no record for this identifier."
+    if status_code == 429:
+        return "Rate limit or quota exceeded. Try again later or reduce request volume."
+    if 500 <= status_code < 600:
+        return f"Server error ({status_code}). Try again later."
+    return f"Request failed (HTTP {status_code}). Try again later."
+
+
+def serpapi_error_message(error_str):
+    """Map SerpAPI error string to user-friendly message."""
+    if not error_str:
+        return "SerpAPI request failed."
+    e = (error_str or "").lower()
+    if "invalid" in e and "key" in e:
+        return "Invalid SerpAPI key. Check your key in the sidebar."
+    if "rate" in e or "quota" in e or "limit" in e:
+        return "SerpAPI rate limit or quota exceeded. Try again later."
+    if "not found" in e or "404" in e:
+        return "No result found for this DOI."
+    return (error_str[:80] + "…") if len(error_str) > 80 else error_str
+
 
 # ==========================================
 # HELPER FUNCTIONS (WOS)
@@ -153,21 +179,35 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
             elif response.status_code == 429:
                 status_text.text(f"Rate limit hit at {wos_id}. Sleeping 3s...")
                 time.sleep(3)
-                continue  # Skip appending, user can retry
-            else:
-                # Same columns as success so DataFrame always has "DOI" etc.
                 results.append({
                     "Unique WOS ID": wos_id, "DOI": "N/A", "WOS search (DO)": "N/A", "Title": "N/A", "Author Full Names": "N/A",
                     "Query (AU)": "N/A", "Document Type": "N/A", "Source Title": "N/A", "Publish Year": "N/A",
                     "Volume": "N/A", "Issue": "N/A", "Citation Count": "N/A",
-                    "Status": f"Failed (Code: {response.status_code}) — document not found"
+                    "Status": api_error_message("WOS", 429),
                 })
+            else:
+                msg = api_error_message("WOS", response.status_code, getattr(response, "text", None))
+                results.append({
+                    "Unique WOS ID": wos_id, "DOI": "N/A", "WOS search (DO)": "N/A", "Title": "N/A", "Author Full Names": "N/A",
+                    "Query (AU)": "N/A", "Document Type": "N/A", "Source Title": "N/A", "Publish Year": "N/A",
+                    "Volume": "N/A", "Issue": "N/A", "Citation Count": "N/A",
+                    "Status": msg,
+                })
+        except requests.RequestException as e:
+            code = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+            msg = api_error_message("WOS", code, str(e)) if code else f"Request failed: {str(e)[:60]}"
+            results.append({
+                "Unique WOS ID": wos_id, "DOI": "N/A", "WOS search (DO)": "N/A", "Title": "N/A", "Author Full Names": "N/A",
+                "Query (AU)": "N/A", "Document Type": "N/A", "Source Title": "N/A", "Publish Year": "N/A",
+                "Volume": "N/A", "Issue": "N/A", "Citation Count": "N/A",
+                "Status": msg,
+            })
         except Exception as e:
             results.append({
                 "Unique WOS ID": wos_id, "DOI": "N/A", "WOS search (DO)": "N/A", "Title": "N/A", "Author Full Names": "N/A",
                 "Query (AU)": "N/A", "Document Type": "N/A", "Source Title": "N/A", "Publish Year": "N/A",
                 "Volume": "N/A", "Issue": "N/A", "Citation Count": "N/A",
-                "Status": f"Error: {str(e)}"
+                "Status": f"Error: {str(e)[:60]}",
             })
 
         progress_bar.progress((i + 1) / total)
@@ -178,7 +218,7 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
 # ==========================================
 # HELPER FUNCTIONS (SCOPUS – Elsevier Citation Metrics by DOI)
 # ==========================================
-def fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False):
+def fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False, _retry_count=0):
     """Fetches data from the Elsevier Abstract Citations API."""
     url = f"https://api.elsevier.com/content/abstract/citations?doi={doi}&apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json"
     if exclude_self:
@@ -186,11 +226,11 @@ def fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False):
     response = requests.get(url)
     if response.status_code == 200:
         return response.json()
-    elif response.status_code == 429:
+    if response.status_code == 429 and _retry_count < 2:
         time.sleep(2)
-        return fetch_elsevier_citations(doi, api_key, inst_token, exclude_self)
-    else:
-        response.raise_for_status()
+        return fetch_elsevier_citations(doi, api_key, inst_token, exclude_self, _retry_count + 1)
+    response.raise_for_status()
+    return response.json()
 
 
 def process_doi_scopus(doi, api_key, inst_token):
@@ -221,6 +261,30 @@ def process_doi_scopus(doi, api_key, inst_token):
             "Non-Self Citations": exclude_self_citations,
             "Status": "Success",
         }
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else None
+        msg = api_error_message("Scopus", code, e.response.text if e.response else None)
+        return {
+            "DOI": doi,
+            "Title": "Error",
+            "Year": "N/A",
+            "Type": "N/A",
+            "Total Citations": "0",
+            "Non-Self Citations": "0",
+            "Status": msg,
+        }
+    except requests.RequestException as e:
+        code = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
+        msg = api_error_message("Scopus", code, str(e)) if code else f"Request failed: {str(e)[:50]}"
+        return {
+            "DOI": doi,
+            "Title": "Error",
+            "Year": "N/A",
+            "Type": "N/A",
+            "Total Citations": "0",
+            "Non-Self Citations": "0",
+            "Status": msg,
+        }
     except Exception as e:
         return {
             "DOI": doi,
@@ -229,7 +293,7 @@ def process_doi_scopus(doi, api_key, inst_token):
             "Type": "N/A",
             "Total Citations": "0",
             "Non-Self Citations": "0",
-            "Status": (str(e)[:50] + "..."),
+            "Status": f"Error: {str(e)[:60]}",
         }
 
 
@@ -283,10 +347,11 @@ def _parse_gs_organic(first, doi):
 
 def fetch_google_scholar_result(doi, api_key):
     """Fetch full Google Scholar result by DOI. Returns dict with Title, Authors, Publication, citations, etc."""
+    empty = {"DOI": doi or "N/A", "Title": "N/A", "Authors": "N/A", "Publication": "N/A", "Snippet": "N/A", "Link": "N/A", "Google Scholar citations": "N/A", "Status": "N/A"}
     if not doi or doi == "N/A" or not api_key or not api_key.strip():
-        return {"DOI": doi or "N/A", "Title": "N/A", "Authors": "N/A", "Publication": "N/A", "Snippet": "N/A", "Link": "N/A", "Google Scholar citations": "N/A"}
+        return empty
     if not SERPAPI_AVAILABLE:
-        return {"DOI": doi, "Title": "N/A", "Authors": "N/A", "Publication": "N/A", "Snippet": "N/A", "Link": "N/A", "Google Scholar citations": "N/A"}
+        return {**empty, "DOI": doi, "Status": "SerpAPI client not installed (pip install google-search-results)."}
     try:
         params = {
             "engine": "google_scholar",
@@ -296,12 +361,26 @@ def fetch_google_scholar_result(doi, api_key):
         }
         search = SerpApiGoogleSearch(params)
         results = search.get_dict()
+        # SerpAPI error (quota, invalid key, etc.)
+        err = results.get("error") or results.get("error_message")
+        if err:
+            msg = serpapi_error_message(str(err))
+            return {**empty, "DOI": doi, "Status": msg}
         organic = results.get("organic_results") or []
         if not organic:
-            return {"DOI": doi, "Title": "N/A", "Authors": "N/A", "Publication": "N/A", "Snippet": "N/A", "Link": "N/A", "Google Scholar citations": "N/A"}
-        return _parse_gs_organic(organic[0], doi)
-    except Exception:
-        return {"DOI": doi, "Title": "N/A", "Authors": "N/A", "Publication": "N/A", "Snippet": "N/A", "Link": "N/A", "Google Scholar citations": "N/A"}
+            return {**empty, "DOI": doi, "Status": "No result found for this DOI."}
+        out = _parse_gs_organic(organic[0], doi)
+        out["Status"] = "Success"
+        return out
+    except Exception as e:
+        err_str = str(e).lower()
+        if "429" in err_str or "rate" in err_str or "quota" in err_str:
+            msg = serpapi_error_message("Rate limit or quota exceeded.")
+        elif "401" in err_str or "403" in err_str or "invalid" in err_str or "key" in err_str:
+            msg = serpapi_error_message("Invalid API key.")
+        else:
+            msg = f"Error: {str(e)[:50]}"
+        return {**empty, "DOI": doi, "Status": msg}
 
 
 def fetch_google_scholar_citation(doi, api_key):
