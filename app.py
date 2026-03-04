@@ -492,7 +492,7 @@ def _locked_view(reminder_message):
 
 
 if app_mode == "Web of Science":
-    _title_with_icon("WoS.png", "Web of Science citation finder")
+    _title_with_icon("WoS.png", "Web of Science Citation finder")
     st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
 
     if not api_unlocked:
@@ -568,7 +568,7 @@ if app_mode == "Web of Science":
                 )
 
 elif app_mode == "Scopus":
-    _title_with_icon("Scopus.png", "Scopus Citation Metrics Finder")
+    _title_with_icon("Scopus.png", "Scopus Citation finder")
     st.markdown("Fetch **citation metrics** (total and exclude self-citations) for articles using DOIs. Paste DOIs or upload a file.")
 
     if not api_unlocked:
