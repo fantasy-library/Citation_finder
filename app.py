@@ -484,14 +484,9 @@ def _title_with_icon(icon_filename, title_text):
         st.title(title_text)
 
 
-def _locked_view(icon_filename, reminder_message):
-    """Show locked state: icon + reminder to enter API key."""
+def _locked_view(reminder_message):
+    """Show locked state: reminder to enter API key (icon only in title)."""
     st.markdown("<br>", unsafe_allow_html=True)
-    icon_path = _icons_dir / icon_filename
-    if icon_path.exists():
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c2:
-            st.image(str(icon_path), width=100)
     st.info(f"🔒 **{reminder_message}**")
     st.caption("Enter your API key in the **sidebar** to unlock the search view.")
 
@@ -501,7 +496,7 @@ if app_mode == "Web of Science":
     st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
 
     if not api_unlocked:
-        _locked_view("WoS.png", "Please enter your API key")
+        _locked_view(api_reminder)
     else:
         raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
 
@@ -577,7 +572,7 @@ elif app_mode == "Scopus":
     st.markdown("Fetch **citation metrics** (total and exclude self-citations) for articles using DOIs. Paste DOIs or upload a file.")
 
     if not api_unlocked:
-        _locked_view("Scopus.png", "Please enter your API key")
+        _locked_view(api_reminder)
     else:
         raw_dois = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
         uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
@@ -631,11 +626,11 @@ elif app_mode == "Scopus":
             )
 
 elif app_mode == "Google Scholar":
-    _title_with_icon("Google.png", "Google Scholar Citation Lookup")
+    _title_with_icon("Google.png", "Google Scholar Citation finder")
     st.markdown("Fetch **citation counts** by DOI using SerpAPI. Paste one DOI per line.")
 
     if not api_unlocked:
-        _locked_view("Google.png", "Please enter your API key")
+        _locked_view(api_reminder)
     elif not SERPAPI_AVAILABLE:
         st.warning("⚠️ Install the SerpAPI client: **pip install google-search-results**")
     else:
