@@ -398,9 +398,6 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                         else:
                             cite_score = first
 
-                    # Quartile: Scopus Serial Title API does not provide it; from Scimago
-                    journal_quartile = "N/A"
-
                     results.append({
                         "Journal Title": entry.get("dc:title", "N/A"),
                         "Publisher": entry.get("dc:publisher", "N/A"),
@@ -409,7 +406,6 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                         "CiteScore": cite_score,
                         "SNIP": snip,
                         "SJR": sjr,
-                        "Journal Quartile": journal_quartile,
                         "Subject Areas": subject_str or "N/A",
                         "Aggregation Type": entry.get("prism:aggregationType", "N/A"),
                         "Queried ISSN": issn,
@@ -746,7 +742,6 @@ elif app_mode == "Scopus":
 
         else:
             st.markdown("Fetch **journal metrics** (Journal Title, CiteScore, SNIP, SJR, Subject Areas, etc.) using **ISSNs**. One ISSN per line.")
-            st.caption("Journal Quartile (Q1–Q4) is not provided by the Scopus Serial Title API; you can look it up on [Scimago](https://www.scimagojr.com/).")
             raw_issn_text = st.text_area("📋 Enter ISSN numbers (one per line):", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
             _j1, _j2, _j3 = st.columns([1, 1, 1])
