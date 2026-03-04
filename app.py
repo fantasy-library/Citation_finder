@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import time
 import io
+import re
 from pathlib import Path
 
 try:
@@ -320,6 +321,117 @@ def extract_dois_from_df(df):
         return [str(val).strip() for val in df[doi_col] if str(val).strip().startswith("10.")]
     return []
 
+
+# ==========================================
+# SCOPUS – Journal metrics by ISSN (Serial Title API)
+# ==========================================
+def clean_issn(issn_str):
+    """Normalize ISSN: strip whitespace and hyphens, return 8-char uppercase or None."""
+    if not issn_str or not isinstance(issn_str, str):
+        return None
+    cleaned = re.sub(r"[-\s]", "", issn_str.strip().upper())
+    return cleaned if len(cleaned) == 8 else None
+
+
+def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_text):
+    """Fetch journal metadata and metrics (CiteScore, SNIP, SJR, etc.) by ISSN."""
+    results = []
+    total = len(issns)
+    base_url = "https://api.elsevier.com/content/serial/title/issn"
+
+    for i, issn in enumerate(issns):
+        status_text.text(f"Fetching ISSN {i+1} of {total}: {issn}...")
+        url = f"{base_url}/{issn}?apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json"
+
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                try:
+                    resp = data.get("serial-metadata-response", {})
+                    entries = resp.get("entry") or []
+                    if not entries:
+                        results.append({"Queried ISSN": issn, "Status": "No journal data found"})
+                        progress_bar.progress((i + 1) / total)
+                        time.sleep(0.6)
+                        continue
+                    entry = entries[0] if isinstance(entries, list) else entries
+
+                    # Subject areas
+                    subject_areas = entry.get("subject-area") or []
+                    if isinstance(subject_areas, list):
+                        areas = [s.get("$", s) if isinstance(s, dict) else str(s) for s in subject_areas]
+                    else:
+                        areas = [str(subject_areas)]
+                    subject_str = "; ".join(a for a in areas if a)
+
+                    # SNIP (latest year)
+                    snip = "N/A"
+                    snip_list = entry.get("SNIPList", {}) or {}
+                    snip_items = snip_list.get("SNIP", []) if isinstance(snip_list, dict) else []
+                    if snip_items:
+                        first = snip_items[0] if isinstance(snip_items[0], dict) else None
+                        snip = first.get("$", snip_items[0]) if first else snip_items[0]
+
+                    # SJR (latest year)
+                    sjr = "N/A"
+                    sjr_list = entry.get("SJRList", {}) or {}
+                    sjr_items = sjr_list.get("SJR", []) if isinstance(sjr_list, dict) else []
+                    if sjr_items:
+                        first = sjr_items[0] if isinstance(sjr_items[0], dict) else None
+                        sjr = first.get("$", sjr_items[0]) if first else sjr_items[0]
+
+                    # CiteScore (current metric)
+                    cite_score = "N/A"
+                    cs_list = entry.get("citeScoreYearInfoList", {}) or {}
+                    if isinstance(cs_list, dict):
+                        raw_cs = cs_list.get("citeScoreCurrentMetric")
+                        if isinstance(raw_cs, dict):
+                            cite_score = raw_cs.get("$", "N/A") or "N/A"
+                        elif raw_cs is not None:
+                            cite_score = raw_cs
+                    elif isinstance(cs_list, list) and cs_list:
+                        first = cs_list[0]
+                        if isinstance(first, dict):
+                            raw_cs = first.get("citeScoreCurrentMetric", first.get("$"))
+                            cite_score = raw_cs.get("$", raw_cs) if isinstance(raw_cs, dict) else (raw_cs or "N/A")
+                        else:
+                            cite_score = first
+
+                    # Quartile: Scopus Serial Title API does not provide it; from Scimago
+                    journal_quartile = "N/A"
+
+                    results.append({
+                        "Journal Title": entry.get("dc:title", "N/A"),
+                        "Publisher": entry.get("dc:publisher", "N/A"),
+                        "Print ISSN": entry.get("prism:issn", "N/A"),
+                        "eISSN": entry.get("prism:eIssn", "N/A"),
+                        "CiteScore": cite_score,
+                        "SNIP": snip,
+                        "SJR": sjr,
+                        "Journal Quartile": journal_quartile,
+                        "Subject Areas": subject_str or "N/A",
+                        "Aggregation Type": entry.get("prism:aggregationType", "N/A"),
+                        "Queried ISSN": issn,
+                        "Status": "Success",
+                    })
+                except (KeyError, IndexError, TypeError) as e:
+                    results.append({"Queried ISSN": issn, "Status": f"No journal data found ({str(e)[:40]})"})
+            elif response.status_code == 429:
+                status_text.text(f"Rate limit hit at {issn}. Sleeping 3s...")
+                time.sleep(3)
+                results.append({"Queried ISSN": issn, "Status": api_error_message("Scopus", 429)})
+            else:
+                msg = api_error_message("Scopus", response.status_code, getattr(response, "text", None))
+                results.append({"Queried ISSN": issn, "Status": msg})
+        except Exception as e:
+            results.append({"Queried ISSN": issn, "Status": f"Error: {str(e)[:60]}"})
+
+        progress_bar.progress((i + 1) / total)
+        time.sleep(0.6)
+
+    return results
+
 # ==========================================
 # GOOGLE SCHOLAR (SerpAPI) – full result or citation only
 # ==========================================
@@ -569,61 +681,101 @@ if app_mode == "Web of Science":
 
 elif app_mode == "Scopus":
     _title_with_icon("Scopus.png", "Scopus Citation finder")
-    st.markdown("Fetch **citation metrics** (total and exclude self-citations) for articles using DOIs. Paste DOIs or upload a file.")
-
     if not api_unlocked:
         _locked_view(api_reminder)
     else:
-        raw_dois = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
-        uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
+        scopus_search_mode = st.radio(
+            "Search type:",
+            ["Citation finder (by DOI)", "Journal metrics (by ISSN)"],
+            horizontal=True,
+            key="scopus_mode",
+        )
 
-        _c1, _c2, _c3 = st.columns([1, 1, 1])
-        with _c2:
-            _scopus_clicked = st.button("🔍 Search Scopus", type="primary", use_container_width=True, key="scopus_bulk_btn")
+        if scopus_search_mode == "Citation finder (by DOI)":
+            st.markdown("Fetch **citation metrics** (total and exclude self-citations) for articles using DOIs. Paste DOIs or upload a file.")
+            raw_dois = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
+            uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
 
-        if _scopus_clicked:
-            text_dois = [d.strip() for d in raw_dois.split("\n") if d.strip().startswith("10.")]
-            file_dois = []
-            if uploaded_file is not None:
-                try:
-                    if uploaded_file.name.endswith(".csv"):
-                        df = pd.read_csv(uploaded_file)
-                    else:
-                        df = pd.read_excel(uploaded_file)
-                    file_dois = extract_dois_from_df(df)
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
-            all_dois = list(set(text_dois + file_dois))
+            _c1, _c2, _c3 = st.columns([1, 1, 1])
+            with _c2:
+                _scopus_clicked = st.button("🔍 Search Scopus", type="primary", use_container_width=True, key="scopus_bulk_btn")
 
-            if not all_dois:
-                st.warning("No valid DOIs found. Please ensure they start with '10.'")
-            else:
-                st.info(f"Processing {len(all_dois)} unique DOIs...")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                results_list = []
-                sleep_time = 1.25
-                for i, doi in enumerate(all_dois):
-                    status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
-                    result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
-                    results_list.append(result)
-                    progress_bar.progress((i + 1) / len(all_dois))
-                    time.sleep(sleep_time)
-                status_text.success(f"✅ Finished processing {len(results_list)} records!")
-                df_results = pd.DataFrame(results_list)
-                df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Exclude self-citations", "Status"]]
-                st.session_state["scopus_df"] = df_results
+            if _scopus_clicked:
+                text_dois = [d.strip() for d in raw_dois.split("\n") if d.strip().startswith("10.")]
+                file_dois = []
+                if uploaded_file is not None:
+                    try:
+                        if uploaded_file.name.endswith(".csv"):
+                            df = pd.read_csv(uploaded_file)
+                        else:
+                            df = pd.read_excel(uploaded_file)
+                        file_dois = extract_dois_from_df(df)
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+                all_dois = list(set(text_dois + file_dois))
 
-        if "scopus_df" in st.session_state:
-            st.dataframe(st.session_state["scopus_df"], use_container_width=True)
-            excel_data = to_excel(st.session_state["scopus_df"])
-            st.download_button(
-                label="📥 Download results (.xlsx)",
-                data=excel_data,
-                file_name="scopus_citation_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="scopus_download_btn",
-            )
+                if not all_dois:
+                    st.warning("No valid DOIs found. Please ensure they start with '10.'")
+                else:
+                    st.info(f"Processing {len(all_dois)} unique DOIs...")
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    results_list = []
+                    sleep_time = 1.25
+                    for i, doi in enumerate(all_dois):
+                        status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
+                        result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                        results_list.append(result)
+                        progress_bar.progress((i + 1) / len(all_dois))
+                        time.sleep(sleep_time)
+                    status_text.success(f"✅ Finished processing {len(results_list)} records!")
+                    df_results = pd.DataFrame(results_list)
+                    df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Exclude self-citations", "Status"]]
+                    st.session_state["scopus_df"] = df_results
+
+            if "scopus_df" in st.session_state and scopus_search_mode == "Citation finder (by DOI)":
+                st.dataframe(st.session_state["scopus_df"], use_container_width=True)
+                excel_data = to_excel(st.session_state["scopus_df"])
+                st.download_button(
+                    label="📥 Download results (.xlsx)",
+                    data=excel_data,
+                    file_name="scopus_citation_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="scopus_download_btn",
+                )
+
+        else:
+            st.markdown("Fetch **journal metrics** (Journal Title, CiteScore, SNIP, SJR, Subject Areas, etc.) using **ISSNs**. One ISSN per line.")
+            st.caption("Journal Quartile (Q1–Q4) is not provided by the Scopus Serial Title API; you can look it up on [Scimago](https://www.scimagojr.com/).")
+            raw_issn_text = st.text_area("📋 Enter ISSN numbers (one per line):", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
+
+            _j1, _j2, _j3 = st.columns([1, 1, 1])
+            with _j2:
+                _journal_clicked = st.button("🔍 Search Scopus Journals", type="primary", use_container_width=True, key="scopus_journal_btn")
+
+            if _journal_clicked:
+                raw_lines = [line.strip() for line in raw_issn_text.split("\n") if line.strip()]
+                clean_issns = [clean_issn(issn) for issn in raw_lines if clean_issn(issn)]
+                if not clean_issns:
+                    st.warning("Please enter valid 8-character ISSNs (with or without hyphen).")
+                else:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    journal_data = fetch_scopus_journal_data(clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text)
+                    status_text.success(f"✅ Finished processing {len(journal_data)} records!")
+                    df_journal = pd.DataFrame(journal_data)
+                    st.session_state["scopus_journal_df"] = df_journal
+
+            if "scopus_journal_df" in st.session_state:
+                st.dataframe(st.session_state["scopus_journal_df"], use_container_width=True)
+                excel_journal = to_excel(st.session_state["scopus_journal_df"])
+                st.download_button(
+                    label="📥 Download journal metrics (.xlsx)",
+                    data=excel_journal,
+                    file_name="scopus_journal_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="scopus_journal_download_btn",
+                )
 
 elif app_mode == "Google Scholar":
     _title_with_icon("Google.png", "Google Scholar Citation finder")
