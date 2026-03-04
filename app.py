@@ -22,10 +22,14 @@ except Exception:
     _default_inst_token = ""
 
 # Navigation first so we know which credentials to require
-st.sidebar.title("Navigation")
-app_mode = st.sidebar.radio("Select Database API:", ["Web of Science", "Scopus", "Google Scholar"])
+st.sidebar.title("🧭 Navigation")
+app_mode = st.sidebar.radio(
+    "Select Database API:",
+    ["Web of Science", "Scopus", "Google Scholar"],
+    format_func=lambda x: {"Web of Science": "📚 Web of Science", "Scopus": "📈 Scopus", "Google Scholar": "🎓 Google Scholar"}[x],
+)
 st.sidebar.markdown("---")
-st.sidebar.header("API configuration")
+st.sidebar.header("🔑 API configuration")
 
 # Highlight which key(s) to enter for the selected mode
 if app_mode == "Web of Science":
@@ -320,20 +324,62 @@ def to_excel(df):
 
 
 # ==========================================
-# USER INTERFACE
+# USER INTERFACE – Professional styling & icons
 # ==========================================
-st.markdown(
-    """<style> .stButton > button { padding: 0.5rem 1.5rem; font-size: 1.05rem; font-weight: 600; } </style>""",
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+    /* Main container & typography */
+    .main .block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1100px; }
+    h1 { font-weight: 700; letter-spacing: -0.02em; color: #1e293b; margin-bottom: 0.25rem !important; }
+    h2 { font-weight: 600; color: #334155; font-size: 1.25rem !important; margin-top: 1.5rem !important; }
+    h3 { font-weight: 600; color: #475569; font-size: 1.1rem !important; }
+    p { color: #64748b; }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] { background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); }
+    [data-testid="stSidebar"] .stMarkdown { color: #334155; }
+    [data-testid="stSidebar"] h1 { font-size: 1.35rem !important; }
+    [data-testid="stSidebar"] .stRadio label { font-weight: 500; }
+
+    /* Cards / sections */
+    .stTabs [data-baseweb="tab-list"] { gap: 0.5rem; margin-bottom: 1.5rem; }
+    .stTabs [data-baseweb="tab"] { padding: 0.6rem 1.2rem; font-weight: 600; border-radius: 8px; }
+    .stTabs [aria-selected="true"] { background: #0ea5e9 !important; color: white !important; }
+
+    /* Metrics */
+    [data-testid="stMetric"] { background: #f8fafc; padding: 1rem 1.25rem; border-radius: 10px; border: 1px solid #e2e8f0; }
+    [data-testid="stMetricLabel"] { font-size: 0.8rem !important; font-weight: 600 !important; color: #64748b !important; text-transform: uppercase; letter-spacing: 0.03em; }
+    [data-testid="stMetricValue"] { font-size: 1.5rem !important; font-weight: 700 !important; color: #0f172a !important; }
+
+    /* Buttons */
+    .stButton > button { padding: 0.6rem 1.5rem; font-size: 1rem; font-weight: 600; border-radius: 8px; transition: transform 0.15s ease, box-shadow 0.15s ease; }
+    .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(14, 165, 233, 0.25); }
+    .stButton > button[kind="primary"] { background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%); border: none; }
+
+    /* Inputs */
+    .stTextInput input, .stTextArea textarea { border-radius: 8px; border: 1px solid #e2e8f0; }
+    .stTextInput input:focus, .stTextArea textarea:focus { border-color: #0ea5e9; box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.2); }
+
+    /* Dataframe */
+    .stDataFrame { border-radius: 10px; overflow: hidden; border: 1px solid #e2e8f0; }
+
+    /* Alerts & captions */
+    .stAlert { border-radius: 8px; }
+    .stCaption { color: #94a3b8 !important; font-size: 0.85rem !important; }
+
+    /* Divider */
+    hr { margin: 1.5rem 0 !important; border-color: #e2e8f0 !important; }
+</style>
+""", unsafe_allow_html=True)
+
 st.sidebar.markdown("---")
-st.sidebar.info("You only need to enter the API key(s) for the database you select above. Keys are not saved to disk.")
+st.sidebar.caption("🔐 Enter only the API key(s) for the selected database. Keys are not stored on disk.")
 
 if app_mode == "Web of Science":
-    st.title("Web of Science Document Fetcher")
-    st.markdown("Fetch article metadata, full authors, and citation counts using Unique WOS IDs.")
+    st.title("📚 Web of Science Document Fetcher")
+    st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
 
-    raw_wos_text = st.text_area("Paste WOS IDs here (One per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
+    raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
 
     _c1, _c2, _c3 = st.columns([1, 1, 1])
     with _c2:
@@ -365,9 +411,10 @@ if app_mode == "Web of Science":
         _gs_clicked = False
         if SERPAPI_KEY and SERPAPI_KEY.strip():
             st.markdown("---")
+            st.subheader("📊 Enrich with Google Scholar")
             _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
             with _gc2:
-                _gs_clicked = st.button("📊 Add Google Scholar citations", type="secondary", use_container_width=True)
+                _gs_clicked = st.button("🎓 Add Google Scholar citations", type="secondary", use_container_width=True)
         elif not SERPAPI_AVAILABLE:
             st.sidebar.caption("Install `google-search-results` for Google Scholar: pip install google-search-results")
         else:
@@ -391,10 +438,10 @@ if app_mode == "Web of Science":
             st.session_state["wos_df"] = df_show
 
         if "Google Scholar citations" in df_show.columns or not _gs_clicked:
-            st.dataframe(st.session_state["wos_df"])
+            st.dataframe(st.session_state["wos_df"], use_container_width=True)
             excel_data = to_excel(st.session_state["wos_df"])
             st.download_button(
-                label="📥 Download WOS Excel File",
+                label="📥 Download results (.xlsx)",
                 data=excel_data,
                 file_name="wos_bulk_results.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -402,105 +449,70 @@ if app_mode == "Web of Science":
             )
 
 elif app_mode == "Scopus":
-    st.title("Citation Metrics Finder")
-    st.markdown("Discover citation metrics for research articles using Digital Object Identifiers (DOIs). Powered by Elsevier.")
+    st.title("📈 Scopus Citation Metrics Finder")
+    st.markdown("Fetch **citation metrics** (total and non-self) for articles using DOIs. Paste DOIs or upload a file.")
 
-    tab1, tab2 = st.tabs(["Single Article", "Bulk Processing"])
+    raw_dois = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
+    uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
 
-    with tab1:
-        st.subheader("Search a Single DOI")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            doi_input = st.text_input("Enter article DOI:", placeholder="e.g., 10.5194/bg-18-2755-2021", key="scopus_doi_input")
-        with col2:
-            st.write("")
-            st.write("")
-            search_btn = st.button("Search", type="primary", use_container_width=True, key="scopus_single_btn")
-        st.caption("Examples: `10.5194/bg-18-2755-2021` | `10.3389/fmars.2021.615929` | `10.1038/s41586-020-2008-3`")
+    _c1, _c2, _c3 = st.columns([1, 1, 1])
+    with _c2:
+        _scopus_clicked = st.button("🔍 Search Scopus", type="primary", use_container_width=True, key="scopus_bulk_btn")
 
-        if search_btn and doi_input:
-            if not doi_input.strip().startswith("10."):
-                st.error("Please enter a valid DOI (should start with '10.')")
-            else:
-                with st.spinner("Retrieving citation data from Elsevier API..."):
-                    result = process_doi_scopus(doi_input.strip(), SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
-                    if result["Status"] == "Success":
-                        st.success("Article located successfully!")
-                        st.markdown(f"### {result['Title']}")
-                        m_col1, m_col2, m_col3 = st.columns(3)
-                        m_col1.metric("Publication Type", result["Type"])
-                        m_col2.metric("Publication Year", result["Year"])
-                        m_col3.metric("DOI", result["DOI"])
-                        st.divider()
-                        c_col1, c_col2 = st.columns(2)
-                        with c_col1:
-                            st.metric("Total Citations", result["Total Citations"], help="Includes all citations to this research article")
-                        with c_col2:
-                            st.metric("Non-Self Citations", result["Non-Self Citations"], help="Citations from other researchers only")
-                    else:
-                        st.error(f"Failed to fetch data: {result['Status']}")
+    if _scopus_clicked:
+        text_dois = [d.strip() for d in raw_dois.split("\n") if d.strip().startswith("10.")]
+        file_dois = []
+        if uploaded_file is not None:
+            try:
+                if uploaded_file.name.endswith(".csv"):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
+                file_dois = extract_dois_from_df(df)
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+        all_dois = list(set(text_dois + file_dois))
 
-    with tab2:
-        st.subheader("Process Multiple DOIs")
-        st.markdown("##### 1. Paste DOIs")
-        raw_dois = st.text_area("Enter one DOI per line:", height=150, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
-        st.markdown("##### 2. Or Upload a File (.csv, .xlsx)")
-        uploaded_file = st.file_uploader("Upload a spreadsheet containing a 'DOI' column", type=["csv", "xlsx", "xls"], key="scopus_upload")
+        if not all_dois:
+            st.warning("No valid DOIs found. Please ensure they start with '10.'")
+        else:
+            st.info(f"Processing {len(all_dois)} unique DOIs...")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            results_list = []
+            sleep_time = 1.25
+            for i, doi in enumerate(all_dois):
+                status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
+                result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                results_list.append(result)
+                progress_bar.progress((i + 1) / len(all_dois))
+                time.sleep(sleep_time)
+            status_text.success(f"✅ Finished processing {len(results_list)} records!")
+            df_results = pd.DataFrame(results_list)
+            df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Non-Self Citations", "Status"]]
+            st.session_state["scopus_df"] = df_results
 
-        if st.button("Process Bulk DOIs", type="primary", key="scopus_bulk_btn"):
-            text_dois = [d.strip() for d in raw_dois.split("\n") if d.strip().startswith("10.")]
-            file_dois = []
-            if uploaded_file is not None:
-                try:
-                    if uploaded_file.name.endswith(".csv"):
-                        df = pd.read_csv(uploaded_file)
-                    else:
-                        df = pd.read_excel(uploaded_file)
-                    file_dois = extract_dois_from_df(df)
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
-            all_dois = list(set(text_dois + file_dois))
-
-            if not all_dois:
-                st.warning("No valid DOIs found. Please ensure they start with '10.'")
-            else:
-                st.info(f"Processing {len(all_dois)} unique DOIs...")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                results_list = []
-                sleep_time = 1.25
-                for i, doi in enumerate(all_dois):
-                    status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
-                    result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
-                    results_list.append(result)
-                    progress_bar.progress((i + 1) / len(all_dois))
-                    time.sleep(sleep_time)
-                status_text.success("Bulk processing complete!")
-                df_results = pd.DataFrame(results_list)
-                df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Non-Self Citations", "Status"]]
-                st.dataframe(df_results, use_container_width=True)
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    df_results.to_excel(writer, index=False, sheet_name="Citation Results")
-                excel_data = output.getvalue()
-                st.download_button(
-                    label="Download Results (.xlsx)",
-                    data=excel_data,
-                    file_name="citation_metrics_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="scopus_download_btn",
-                )
+    if "scopus_df" in st.session_state:
+        st.dataframe(st.session_state["scopus_df"], use_container_width=True)
+        excel_data = to_excel(st.session_state["scopus_df"])
+        st.download_button(
+            label="📥 Download results (.xlsx)",
+            data=excel_data,
+            file_name="scopus_citation_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="scopus_download_btn",
+        )
 
 elif app_mode == "Google Scholar":
-    st.title("Google Scholar Citation Lookup")
-    st.markdown("Fetch citation counts by DOI using SerpAPI (Google Scholar). Enter one DOI per line.")
+    st.title("🎓 Google Scholar Citation Lookup")
+    st.markdown("Fetch **citation counts** by DOI using SerpAPI. Paste one DOI per line.")
 
     if not SERPAPI_AVAILABLE:
-        st.warning("Install the SerpAPI client: **pip install google-search-results**")
+        st.warning("⚠️ Install the SerpAPI client: **pip install google-search-results**")
     elif not SERPAPI_KEY or not SERPAPI_KEY.strip():
-        st.info("Enter your **SerpAPI key** in the sidebar to use Google Scholar search.")
+        st.info("🔑 Enter your **SerpAPI key** in the sidebar to use Google Scholar search.")
     else:
-        raw_doi_text = st.text_area("Paste DOIs here (one per line):", height=200, placeholder="10.1038/s41593-021-00969-4\n10.1109/TMI.2025.3605219")
+        raw_doi_text = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.1038/s41593-021-00969-4\n10.1109/TMI.2025.3605219")
 
         _c1, _c2, _c3 = st.columns([1, 1, 1])
         with _c2:
@@ -521,12 +533,12 @@ elif app_mode == "Google Scholar":
                     gs_results.append(row)
                     progress_gs.progress((i + 1) / len(dois))
                     time.sleep(0.3)
-                status_gs.success(f"✅ Finished {len(gs_results)} DOIs.")
+                status_gs.success(f"✅ Finished processing {len(gs_results)} records!")
                 df_gs = pd.DataFrame(gs_results)
                 st.dataframe(df_gs)
                 excel_data = to_excel(df_gs)
                 st.download_button(
-                    label="📥 Download Google Scholar Excel File",
+                    label="📥 Download results (.xlsx)",
                     data=excel_data,
                     file_name="google_scholar_citations.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
