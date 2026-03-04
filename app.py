@@ -709,112 +709,73 @@ if app_mode == "Web of Science":
     if not api_unlocked:
         _locked_view(api_reminder)
     else:
-        wos_search_mode = st.radio(
-            "Search type:",
-            ["Document lookup (WOS IDs)", "Journal metrics (ISSN or title)"],
-            horizontal=True,
-            key="wos_mode",
-        )
+        st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
+        raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
 
-        if wos_search_mode == "Document lookup (WOS IDs)":
-            st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
-            raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
+        _c1, _c2, _c3 = st.columns([1, 1, 1])
+        with _c2:
+            _wos_clicked = st.button("🔍 Search Web of Science", type="primary", use_container_width=True)
 
-            _c1, _c2, _c3 = st.columns([1, 1, 1])
-            with _c2:
-                _wos_clicked = st.button("🔍 Search Web of Science", type="primary", use_container_width=True)
+        if _wos_clicked:
+            wos_ids = [line.strip() for line in raw_wos_text.split('\n') if line.strip()]
+            if wos_ids and "unique wos id" in wos_ids[0].lower():
+                wos_ids.pop(0)  # remove header if pasted
 
-            if _wos_clicked:
-                wos_ids = [line.strip() for line in raw_wos_text.split('\n') if line.strip()]
-                if wos_ids and "unique wos id" in wos_ids[0].lower():
-                    wos_ids.pop(0)  # remove header if pasted
+            if not wos_ids:
+                st.warning("Please enter valid WOS IDs.")
+            else:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-                if not wos_ids:
-                    st.warning("Please enter valid WOS IDs.")
-                else:
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+                wos_data = fetch_wos_data(wos_ids, progress_bar, status_text)
 
-                    wos_data = fetch_wos_data(wos_ids, progress_bar, status_text)
+                success_count = sum(1 for r in wos_data if r.get("Status") == "Success")
+                status_text.success(f"✅ Finished processing {len(wos_data)} records!")
+                if success_count == 0:
+                    st.warning("**Cannot find DOI — no documents could be found.** Please check your WOS IDs (format like `WOS:001681025100006`) and that your API key has access to these documents.")
+                df_wos = pd.DataFrame(wos_data)
+                st.session_state["wos_df"] = df_wos
 
-                    success_count = sum(1 for r in wos_data if r.get("Status") == "Success")
-                    status_text.success(f"✅ Finished processing {len(wos_data)} records!")
-                    if success_count == 0:
-                        st.warning("**Cannot find DOI — no documents could be found.** Please check your WOS IDs (format like `WOS:001681025100006`) and that your API key has access to these documents.")
-                    df_wos = pd.DataFrame(wos_data)
-                    st.session_state["wos_df"] = df_wos
+        if "wos_df" in st.session_state:
+            df_show = st.session_state["wos_df"]
+            _gs_clicked = False
+            if SERPAPI_KEY and SERPAPI_KEY.strip():
+                st.markdown("---")
+                st.subheader("📊 Enrich with Google Scholar")
+                _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
+                with _gc2:
+                    _gs_clicked = st.button("🎓 Add Google Scholar citations", type="secondary", use_container_width=True)
+            elif not SERPAPI_AVAILABLE:
+                st.sidebar.caption("Install `google-search-results` for Google Scholar: pip install google-search-results")
+            else:
+                st.caption("Add a SerpAPI key in the sidebar to fetch Google Scholar citation counts by DOI.")
 
-            if "wos_df" in st.session_state:
-                df_show = st.session_state["wos_df"]
-                _gs_clicked = False
-                if SERPAPI_KEY and SERPAPI_KEY.strip():
-                    st.markdown("---")
-                    st.subheader("📊 Enrich with Google Scholar")
-                    _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
-                    with _gc2:
-                        _gs_clicked = st.button("🎓 Add Google Scholar citations", type="secondary", use_container_width=True)
-                elif not SERPAPI_AVAILABLE:
-                    st.sidebar.caption("Install `google-search-results` for Google Scholar: pip install google-search-results")
-                else:
-                    st.caption("Add a SerpAPI key in the sidebar to fetch Google Scholar citation counts by DOI.")
+            if _gs_clicked and SERPAPI_KEY and SERPAPI_KEY.strip() and SERPAPI_AVAILABLE:
+                dois = df_show["DOI"].astype(str).tolist()
+                total = len(dois)
+                progress_gs = st.progress(0)
+                status_gs = st.empty()
+                gs_citations = []
+                for i, doi in enumerate(dois):
+                    status_gs.text(f"Google Scholar {i+1}/{total}: {doi[:40]}...")
+                    cnt = fetch_google_scholar_citation(doi, SERPAPI_KEY)
+                    gs_citations.append(cnt if cnt is not None else "N/A")
+                    progress_gs.progress((i + 1) / total)
+                    time.sleep(0.3)
+                status_gs.success("✅ Google Scholar citations added.")
+                df_show = df_show.copy()
+                df_show["Google Scholar citations"] = gs_citations
+                st.session_state["wos_df"] = df_show
 
-                if _gs_clicked and SERPAPI_KEY and SERPAPI_KEY.strip() and SERPAPI_AVAILABLE:
-                    dois = df_show["DOI"].astype(str).tolist()
-                    total = len(dois)
-                    progress_gs = st.progress(0)
-                    status_gs = st.empty()
-                    gs_citations = []
-                    for i, doi in enumerate(dois):
-                        status_gs.text(f"Google Scholar {i+1}/{total}: {doi[:40]}...")
-                        cnt = fetch_google_scholar_citation(doi, SERPAPI_KEY)
-                        gs_citations.append(cnt if cnt is not None else "N/A")
-                        progress_gs.progress((i + 1) / total)
-                        time.sleep(0.3)
-                    status_gs.success("✅ Google Scholar citations added.")
-                    df_show = df_show.copy()
-                    df_show["Google Scholar citations"] = gs_citations
-                    st.session_state["wos_df"] = df_show
-
-                if "Google Scholar citations" in df_show.columns or not _gs_clicked:
-                    st.dataframe(st.session_state["wos_df"], use_container_width=True)
-                    excel_data = to_excel(st.session_state["wos_df"])
-                    st.download_button(
-                        label="📥 Download results (.xlsx)",
-                        data=excel_data,
-                        file_name="wos_bulk_results.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="wos_download_btn",
-                    )
-
-        else:
-            st.markdown("Fetch **JCR journal metrics** (Journal Title, JIF, JIF Quartile, JCI, Categories, etc.) by **ISSN** or **journal title**. Uses Web of Science Journals API.")
-            raw_journal_text = st.text_area("📋 Enter ISSN or journal title (one per line):", height=200, placeholder="1061-4036\nNature Genetics\n0309-0566", key="wos_journal_bulk")
-            jcr_year = st.number_input("JCR year (optional; required for JIF/JCI metrics)", min_value=1997, max_value=2030, value=2023, step=1, key="wos_jcr_year")
-
-            _j1, _j2, _j3 = st.columns([1, 1, 1])
-            with _j2:
-                _wos_journal_clicked = st.button("🔍 Search WOS Journals", type="primary", use_container_width=True, key="wos_journal_btn")
-
-            if _wos_journal_clicked:
-                lines = [line.strip() for line in raw_journal_text.split("\n") if line.strip()]
-                if not lines:
-                    st.warning("Please enter at least one ISSN or journal title.")
-                else:
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    journal_data = fetch_wos_journal_data(lines, WOS_API_KEY, jcr_year, progress_bar, status_text)
-                    status_text.success(f"✅ Finished processing {len(journal_data)} records!")
-                    st.session_state["wos_journal_df"] = pd.DataFrame(journal_data)
-
-            if "wos_journal_df" in st.session_state:
-                st.dataframe(st.session_state["wos_journal_df"], use_container_width=True)
-                excel_journal = to_excel(st.session_state["wos_journal_df"])
+            if "Google Scholar citations" in df_show.columns or not _gs_clicked:
+                st.dataframe(st.session_state["wos_df"], use_container_width=True)
+                excel_data = to_excel(st.session_state["wos_df"])
                 st.download_button(
-                    label="📥 Download journal metrics (.xlsx)",
-                    data=excel_journal,
-                    file_name="wos_journal_results.xlsx",
+                    label="📥 Download results (.xlsx)",
+                    data=excel_data,
+                    file_name="wos_bulk_results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="wos_journal_download_btn",
+                    key="wos_download_btn",
                 )
 
 elif app_mode == "Scopus":
