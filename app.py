@@ -661,7 +661,7 @@ st.markdown("""
     /* Buttons */
     .stButton > button { padding: 0.6rem 1.5rem; font-size: 1rem; font-weight: 600; border-radius: 8px; transition: transform 0.15s ease, box-shadow 0.15s ease; }
     .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(14, 165, 233, 0.25); }
-    .stButton > button[kind="primary"] { background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%); border: none; }
+    .stButton > button[kind="primary"] { background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%); border: none; color: white !important; }
 
     /* Inputs */
     .stTextInput input, .stTextArea textarea { border-radius: 8px; border: 1px solid #e2e8f0; }
