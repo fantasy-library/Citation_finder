@@ -492,7 +492,7 @@ def _locked_view(reminder_message):
 
 
 if app_mode == "Web of Science":
-    _title_with_icon("WoS.png", "Web of Science Citation finder")
+    _title_with_icon("WoS.png", "Web of Science (includes SCIE, SSCI and CPCI) Citation Finder")
     st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
 
     if not api_unlocked:
