@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import time
 import io
+from pathlib import Path
 
 try:
     from serpapi import GoogleSearch as SerpApiGoogleSearch
@@ -23,6 +24,15 @@ except Exception:
 
 # Navigation first so we know which credentials to require
 st.sidebar.title("🧭 Navigation")
+# Show database icons (Streamlit radio only supports text labels, so we display icons above)
+_icons_dir = Path(__file__).resolve().parent / "icons"
+try:
+    icon_cols = st.sidebar.columns(3)
+    icon_cols[0].image(str(_icons_dir / "WoS.png"), caption="Web of Science", use_container_width=True)
+    icon_cols[1].image(str(_icons_dir / "Scopus.png"), caption="Scopus", use_container_width=True)
+    icon_cols[2].image(str(_icons_dir / "Google.png"), caption="Google Scholar", use_container_width=True)
+except Exception:
+    pass  # If icons missing, navigation still works with radio only
 app_mode = st.sidebar.radio(
     "Select Database API:",
     ["Web of Science", "Scopus", "Google Scholar"],
@@ -258,7 +268,7 @@ def process_doi_scopus(doi, api_key, inst_token):
             "Year": year,
             "Type": pub_type,
             "Total Citations": total_citations,
-            "Non-Self Citations": exclude_self_citations,
+            "Exclude self-citations": exclude_self_citations,
             "Status": "Success",
         }
     except requests.HTTPError as e:
@@ -270,7 +280,7 @@ def process_doi_scopus(doi, api_key, inst_token):
             "Year": "N/A",
             "Type": "N/A",
             "Total Citations": "0",
-            "Non-Self Citations": "0",
+            "Exclude self-citations": "0",
             "Status": msg,
         }
     except requests.RequestException as e:
@@ -282,7 +292,7 @@ def process_doi_scopus(doi, api_key, inst_token):
             "Year": "N/A",
             "Type": "N/A",
             "Total Citations": "0",
-            "Non-Self Citations": "0",
+            "Exclude self-citations": "0",
             "Status": msg,
         }
     except Exception as e:
@@ -292,7 +302,7 @@ def process_doi_scopus(doi, api_key, inst_token):
             "Year": "N/A",
             "Type": "N/A",
             "Total Citations": "0",
-            "Non-Self Citations": "0",
+            "Exclude self-citations": "0",
             "Status": f"Error: {str(e)[:60]}",
         }
 
@@ -455,7 +465,7 @@ st.sidebar.markdown("---")
 st.sidebar.caption("🔐 Enter only the API key(s) for the selected database. Keys are not stored on disk.")
 
 if app_mode == "Web of Science":
-    st.title("📚 Web of Science Document Fetcher")
+    st.title("📚 Web of Science citation finder")
     st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
 
     raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
@@ -568,7 +578,7 @@ elif app_mode == "Scopus":
                 time.sleep(sleep_time)
             status_text.success(f"✅ Finished processing {len(results_list)} records!")
             df_results = pd.DataFrame(results_list)
-            df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Non-Self Citations", "Status"]]
+            df_results = df_results[["DOI", "Title", "Year", "Total Citations", "Exclude self-citations", "Status"]]
             st.session_state["scopus_df"] = df_results
 
     if "scopus_df" in st.session_state:
