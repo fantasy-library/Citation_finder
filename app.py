@@ -46,6 +46,11 @@ st.sidebar.header("🔑 API configuration")
 if app_mode == "Web of Science":
     st.sidebar.info("⬇️ Enter your **WOS API key** below to get started.")
     WOS_API_KEY = st.sidebar.text_input("WOS API key", type="password", placeholder="Your WOS API key")
+    WOS_JOURNAL_API_KEY = st.sidebar.text_input(
+        "WOS Journal API key (JCR / journals)",
+        type="password",
+        placeholder="Optional: separate WOS Journal API key",
+    )
     SCOPUS_API_KEY = ""
     SCOPUS_INST_TOKEN = _default_inst_token or ""
     SERPAPI_KEY = ""
@@ -62,6 +67,7 @@ else:
     st.sidebar.info("⬇️ Enter your **SerpAPI key** below to get started.")
     SERPAPI_KEY = st.sidebar.text_input("SerpAPI key", type="password", placeholder="Your SerpAPI key")
     WOS_API_KEY = ""
+    WOS_JOURNAL_API_KEY = ""
     SCOPUS_API_KEY = ""
     SCOPUS_INST_TOKEN = _default_inst_token or ""
 
@@ -123,19 +129,65 @@ def serpapi_error_message(error_str):
 # ==========================================
 # HELPER FUNCTIONS (WOS)
 # ==========================================
+WOS_STARTER_BASE = "https://api.clarivate.com/apis/wos-starter/v1"
+
+
 def fetch_wos_data(wos_ids, progress_bar, status_text):
     results = []
     total = len(wos_ids)
 
     for i, wos_id in enumerate(wos_ids):
-        status_text.text(f"Fetching WOS ID {i+1} of {total}: {wos_id}...")
-        url = f"https://api.clarivate.com/apis/wos-starter/v1/documents/{wos_id}"
+        status_text.text(f"Fetching record {i+1} of {total}: {wos_id}...")
+        wos_id = (wos_id or "").strip()
+        is_doi = wos_id.lower().startswith("10.")
+
+        # Build request: by UID (WOS:...) or by DOI using documents search
+        if is_doi:
+            url = f"{WOS_STARTER_BASE}/documents"
+            params = {
+                "db": "WOS",
+                "q": f"DO={wos_id}",
+                "limit": 10,
+                "page": 1,
+            }
+        else:
+            url = f"{WOS_STARTER_BASE}/documents/{wos_id}"
+            params = None
         headers = {"X-ApiKey": WOS_API_KEY}
 
         try:
-            response = requests.get(url, headers=headers)
+            if params is None:
+                response = requests.get(url, headers=headers)
+            else:
+                response = requests.get(url, headers=headers, params=params)
             if response.status_code == 200:
                 data = response.json()
+
+                # For DOI search, the API returns a list of hits; pick the best match
+                if is_doi:
+                    hits = data.get("hits") or []
+                    if not hits:
+                        results.append({
+                            "Unique WOS ID": wos_id,
+                            "DOI": wos_id,
+                            "WOS search (DO)": f"DO={wos_id}",
+                            "Title": "N/A",
+                            "Author Full Names": "N/A",
+                            "Query (AU)": "N/A",
+                            "Document Type": "N/A",
+                            "Source Title": "N/A",
+                            "Publish Year": "N/A",
+                            "Volume": "N/A",
+                            "Issue": "N/A",
+                            "Citation Count": "N/A",
+                            "Status": "No document found for this DOI.",
+                        })
+                        progress_bar.progress((i + 1) / total)
+                        continue
+                    data = hits[0]
+                    wos_uid = data.get("uid") or "N/A"
+                else:
+                    wos_uid = wos_id
 
                 # Extract Authors & formatted query (API may return mixed types)
                 names = data.get('names') or {}
@@ -179,7 +231,7 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
                     citations = []
 
                 results.append({
-                    "Unique WOS ID": wos_id,
+                    "Unique WOS ID": wos_uid,
                     "DOI": doi,
                     "WOS search (DO)": doi_query,
                     "Title": data.get('title', 'N/A'),
@@ -197,7 +249,11 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
                 status_text.text(f"Rate limit hit at {wos_id}. Sleeping 3s...")
                 time.sleep(3)
                 results.append({
-                    "Unique WOS ID": wos_id, "DOI": "N/A", "WOS search (DO)": "N/A", "Title": "N/A", "Author Full Names": "N/A",
+                    "Unique WOS ID": wos_id,
+                    "DOI": "N/A",
+                    "WOS search (DO)": "N/A",
+                    "Title": "N/A",
+                    "Author Full Names": "N/A",
                     "Query (AU)": "N/A", "Document Type": "N/A", "Source Title": "N/A", "Publish Year": "N/A",
                     "Volume": "N/A", "Issue": "N/A", "Citation Count": "N/A",
                     "Status": api_error_message("WOS", 429),
@@ -214,14 +270,22 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
             code = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
             msg = api_error_message("WOS", code, str(e)) if code else f"Request failed: {str(e)[:60]}"
             results.append({
-                "Unique WOS ID": wos_id, "DOI": "N/A", "WOS search (DO)": "N/A", "Title": "N/A", "Author Full Names": "N/A",
+                "Unique WOS ID": wos_id,
+                "DOI": "N/A",
+                "WOS search (DO)": "N/A",
+                "Title": "N/A",
+                "Author Full Names": "N/A",
                 "Query (AU)": "N/A", "Document Type": "N/A", "Source Title": "N/A", "Publish Year": "N/A",
                 "Volume": "N/A", "Issue": "N/A", "Citation Count": "N/A",
                 "Status": msg,
             })
         except Exception as e:
             results.append({
-                "Unique WOS ID": wos_id, "DOI": "N/A", "WOS search (DO)": "N/A", "Title": "N/A", "Author Full Names": "N/A",
+                "Unique WOS ID": wos_id,
+                "DOI": "N/A",
+                "WOS search (DO)": "N/A",
+                "Title": "N/A",
+                "Author Full Names": "N/A",
                 "Query (AU)": "N/A", "Document Type": "N/A", "Source Title": "N/A", "Publish Year": "N/A",
                 "Volume": "N/A", "Issue": "N/A", "Citation Count": "N/A",
                 "Status": f"Error: {str(e)[:60]}",
@@ -240,10 +304,16 @@ WOS_JOURNALS_BASE = "https://api.clarivate.com/apis/wos-journals/v1"
 
 
 def _parse_wos_journal_entry(entry, query):
-    """Parse one journal from WOS Journals API response into a flat row."""
+    """Parse one journal from WOS Journals API response (JournalListRecord or full journal) into a flat row."""
     if not isinstance(entry, dict):
         return {"Query": query, "Status": "Invalid response"}
-    title = entry.get("title") or entry.get("journalTitle") or "N/A"
+    # API returns list items with "name" (journal title), not "title"
+    title = (
+        entry.get("name")
+        or entry.get("title")
+        or entry.get("journalTitle")
+        or "N/A"
+    )
     jcr_id = entry.get("id") or entry.get("jcrAbbrev") or "N/A"
     issn = entry.get("issn") or "N/A"
     eissn = entry.get("eissn") or entry.get("eIssn") or "N/A"
@@ -262,33 +332,99 @@ def _parse_wos_journal_entry(entry, query):
     else:
         cat_str = str(categories)
     cat_str = cat_str or "N/A"
-    impact = entry.get("impactMetrics") or entry.get("metrics") or {}
+    # Metrics can be at top level (impactMetrics) or under metrics.impact_metrics / metrics.impactMetrics
+    metrics_block = entry.get("metrics") or {}
+    impact = (
+        entry.get("impactMetrics")
+        or metrics_block.get("impactMetrics")
+        or metrics_block.get("impact_metrics")
+        or {}
+    )
     if not isinstance(impact, dict):
         impact = {}
     jif = impact.get("jif") if impact.get("jif") is not None else impact.get("journalImpactFactor")
     jif = jif if jif is not None else "N/A"
-    jif_quartile = impact.get("jifQuartile") or impact.get("jif_quartile") or entry.get("jifQuartile") or "N/A"
+    # Quartiles and percentiles can be in impact, source metrics or in ranks.* (JCR API uses ranks models like RanksJif)
+    ranks = entry.get("ranks") or {}
+    raw_jif_rank = ranks.get("jif")
+    if isinstance(raw_jif_rank, list) and raw_jif_rank:
+        _jif_rank = raw_jif_rank[0] if isinstance(raw_jif_rank[0], dict) else {}
+    elif isinstance(raw_jif_rank, dict):
+        _jif_rank = raw_jif_rank
+    else:
+        _jif_rank = {}
+    raw_jci_rank = ranks.get("jci")
+    if isinstance(raw_jci_rank, list) and raw_jci_rank:
+        _jci_rank = raw_jci_rank[0] if isinstance(raw_jci_rank[0], dict) else {}
+    elif isinstance(raw_jci_rank, dict):
+        _jci_rank = raw_jci_rank
+    else:
+        _jci_rank = {}
+    jif_quartile = (
+        impact.get("jifQuartile")
+        or impact.get("jif_quartile")
+        or entry.get("jifQuartile")
+        or _jif_rank.get("quartile")
+        or "N/A"
+    )
+    # Percentiles are exposed via source metrics or ranks (RanksJif / RanksJci) when corresponding filters are used
+    source_metrics = (
+        metrics_block.get("sourceMetrics")
+        or metrics_block.get("source_metrics")
+        or {}
+    )
+    if not isinstance(source_metrics, dict):
+        source_metrics = {}
+    jif_percentile = (
+        source_metrics.get("jifPercentile")
+        or source_metrics.get("jif_percentile")
+        or _jif_rank.get("jif_percentile")
+        or _jif_rank.get("jifPercentile")
+        or None
+    )
     jci = impact.get("jci") or impact.get("journalCitationIndicator")
     jci = jci if jci is not None else "N/A"
-    jci_quartile = impact.get("jciQuartile") or impact.get("jci_quartile") or "N/A"
+    jci_quartile = (
+        impact.get("jciQuartile")
+        or impact.get("jci_quartile")
+        or _jci_rank.get("quartile")
+        or "N/A"
+    )
+    jci_percentile = (
+        source_metrics.get("jciPercentile")
+        or source_metrics.get("jci_percentile")
+        or _jci_rank.get("jci_percentile")
+        or _jci_rank.get("jciPercentile")
+        or None
+    )
+    # JCR year: prefer explicit helper marker, then any jcrYear field present
+    jcr_year_val = (
+        entry.get("_jcr_year")
+        or entry.get("jcrYear")
+        or entry.get("jcr_year")
+        or None
+    )
     return {
         "Journal Title": title,
         "JCR ID": jcr_id,
+        "JCR Year": jcr_year_val or "N/A",
         "ISSN": issn,
         "eISSN": eissn,
         "Publisher": publisher,
         "Edition(s)": edition_str,
         "Categories": cat_str,
         "JIF": jif,
-        "JIF Quartile": jif_quartile,
+        "JIF Percentile": jif_percentile or "N/A",
+        "JIF Quartile": jif_quartile or "N/A",
         "JCI": jci,
-        "JCI Quartile": jci_quartile,
+        "JCI Quartile": jci_quartile or "N/A",
+        "JCI Percentile": jci_percentile or "N/A",
         "Query": query,
         "Status": "Success",
     }
 
 
-def fetch_wos_journal_data(queries, api_key, jcr_year, progress_bar, status_text):
+def fetch_wos_journal_data(queries, api_key, jcr_year, edition_filter, progress_bar, status_text):
     """Fetch JCR journal metrics by search query (ISSN or title). Uses WOS Journals API."""
     results = []
     total = len(queries)
@@ -301,23 +437,118 @@ def fetch_wos_journal_data(queries, api_key, jcr_year, progress_bar, status_text
             continue
         status_text.text(f"Fetching journal {i+1} of {total}: {q[:50]}...")
         url = f"{WOS_JOURNALS_BASE}/journals"
-        params = {"q": q, "limit": 50}
+        # API expects camelCase only (jcrYear, not jcr_year); snake_case params cause 400 Bad Request
+        params = {"q": q, "limit": 50, "page": 1}
+        if edition_filter:
+            params["edition"] = edition_filter
         if jcr_year:
-            params["jcr_year"] = int(jcr_year)
-            params["jif"] = "gte:0"  # request JIF so metrics appear in response
+            year_int = int(jcr_year)
+            params["jcrYear"] = year_int
+            # Turn on impact metrics (JIF/JCI), percentiles, and quartiles without over-filtering
+            params["jif"] = "gte:0"
+            params["jifPercentile"] = "gte:0 AND lte:100"
+            params["jifQuartile"] = "Q1;Q2;Q3;Q4"
+            params["jci"] = "gte:0"
+            params["jciPercentile"] = "gte:0 AND lte:100"
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
             if response.status_code == 200:
                 data = response.json()
-                journal_list = data.get("journalList") or data.get("journals") or data.get("data") or []
+                # WOS Journals API returns list in "hits" (JournalList schema)
+                journal_list = (
+                    data.get("hits")
+                    or data.get("journalList")
+                    or data.get("journals")
+                    or data.get("data")
+                    or []
+                )
                 if isinstance(journal_list, dict):
-                    journal_list = journal_list.get("journal") or journal_list.get("journals") or []
+                    journal_list = journal_list.get("journal") or journal_list.get("journals") or journal_list.get("hits") or []
                 if not journal_list:
                     results.append({"Query": q, "Status": "No journal found"})
                 else:
                     first = journal_list[0] if isinstance(journal_list[0], dict) else None
                     if first:
-                        results.append(_parse_wos_journal_entry(first, q))
+                        # Enrich with journal detail and report data to fill ISSN, publisher, categories, ranks, etc.
+                        enriched = dict(first)
+                        if jcr_year:
+                            try:
+                                enriched["_jcr_year"] = int(jcr_year)
+                            except Exception:
+                                enriched["_jcr_year"] = str(jcr_year)
+                        journal_id = first.get("id")
+
+                        if journal_id:
+                            # Detail endpoint: /journals/{id}
+                            try:
+                                detail_resp = requests.get(
+                                    f"{WOS_JOURNALS_BASE}/journals/{journal_id}",
+                                    headers=headers,
+                                    timeout=30,
+                                )
+                                if detail_resp.status_code == 200:
+                                    d_json = detail_resp.json()
+                                    detail_entry = (
+                                        d_json.get("journal")
+                                        or d_json.get("data")
+                                        or d_json
+                                    )
+                                    if isinstance(detail_entry, dict):
+                                        for k, v in detail_entry.items():
+                                            # Preserve id and name from the list hit
+                                            if k in ("id", "name") and k in enriched:
+                                                continue
+                                            if (
+                                                k in enriched
+                                                and isinstance(enriched[k], dict)
+                                                and isinstance(v, dict)
+                                            ):
+                                                merged = {**enriched[k], **v}
+                                                enriched[k] = merged
+                                            else:
+                                                enriched[k] = v
+                                elif detail_resp.status_code == 429:
+                                    # Back off briefly on per-id detail rate limiting
+                                    time.sleep(2)
+                            except Exception:
+                                # Best-effort enrichment; keep base hit if detail fails
+                                pass
+
+                            # Year-specific report endpoint: /journals/{id}/reports/year/{year}
+                            if jcr_year:
+                                try:
+                                    year_int = int(jcr_year)
+                                    report_resp = requests.get(
+                                        f"{WOS_JOURNALS_BASE}/journals/{journal_id}/reports/year/{year_int}",
+                                        headers=headers,
+                                        timeout=30,
+                                    )
+                                    if report_resp.status_code == 200:
+                                        r_json = report_resp.json()
+                                        report_entry = (
+                                            r_json.get("journal")
+                                            or r_json.get("reports")
+                                            or r_json.get("data")
+                                            or r_json
+                                        )
+                                        if isinstance(report_entry, dict):
+                                            for k, v in report_entry.items():
+                                                if (
+                                                    k in enriched
+                                                    and isinstance(enriched[k], dict)
+                                                    and isinstance(v, dict)
+                                                ):
+                                                    merged = {**enriched[k], **v}
+                                                    enriched[k] = merged
+                                                elif k not in enriched:
+                                                    enriched[k] = v
+                                    elif report_resp.status_code == 429:
+                                        time.sleep(2)
+                                except Exception:
+                                    # If report call fails, we still have list + detail data
+                                    pass
+
+                        results.append(_parse_wos_journal_entry(enriched, q))
                     else:
                         results.append({"Query": q, "Status": "No journal data"})
             elif response.status_code == 429:
@@ -331,7 +562,8 @@ def fetch_wos_journal_data(queries, api_key, jcr_year, progress_bar, status_text
             results.append({"Query": q, "Status": f"Error: {str(e)[:60]}"})
 
         progress_bar.progress((i + 1) / total)
-        time.sleep(0.25)  # stay under 5 req/s
+        # Sleep a bit longer here to account for the extra detail/report calls per journal
+        time.sleep(0.6)
 
     return results
 
@@ -711,73 +943,146 @@ if app_mode == "Web of Science":
     if not api_unlocked:
         _locked_view(api_reminder)
     else:
-        st.markdown("Fetch article metadata, full authors, and citation counts using **Unique WOS IDs**.")
-        raw_wos_text = st.text_area("📋 Paste WOS IDs here (one per line):", height=200, placeholder="WOS:001681025100006\nWOS:001596381600014")
+        wos_search_mode = st.radio(
+            "Search type:",
+            ["Citation finder (by WOS ID or DOI)", "Journal metrics (JCR by ISSN/title)"],
+            horizontal=True,
+            key="wos_mode",
+        )
 
-        _c1, _c2, _c3 = st.columns([1, 1, 1])
-        with _c2:
-            _wos_clicked = st.button("🔍 Search Web of Science", type="primary", use_container_width=True)
+        if wos_search_mode == "Citation finder (by WOS ID or DOI)":
+            st.markdown("Fetch article metadata, full authors, and citation counts using **WOS IDs (UIDs)**. DOIs are also accepted.")
+            st.caption(
+                "For best results, paste Web of Science UIDs (e.g. `WOS:000267144200002`). "
+                "You may also paste DOIs (e.g. `10.3390/cancers16050984`) when UIDs are not available."
+            )
+            raw_wos_text = st.text_area(
+                "📋 Paste WOS IDs (recommended) or DOIs (one per line):",
+                height=200,
+                placeholder="WOS:001681025100006\n10.3390/cancers16050984",
+            )
 
-        if _wos_clicked:
-            wos_ids = [line.strip() for line in raw_wos_text.split('\n') if line.strip()]
-            if wos_ids and "unique wos id" in wos_ids[0].lower():
-                wos_ids.pop(0)  # remove header if pasted
+            _c1, _c2, _c3 = st.columns([1, 1, 1])
+            with _c2:
+                _wos_clicked = st.button("🔍 Search Web of Science", type="primary", use_container_width=True)
 
-            if not wos_ids:
-                st.warning("Please enter valid WOS IDs.")
-            else:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            if _wos_clicked:
+                wos_ids = [line.strip() for line in raw_wos_text.split('\n') if line.strip()]
+                if wos_ids and "unique wos id" in wos_ids[0].lower():
+                    wos_ids.pop(0)  # remove header if pasted
 
-                wos_data = fetch_wos_data(wos_ids, progress_bar, status_text)
+                if not wos_ids:
+                    st.warning("Please enter at least one WOS ID or DOI.")
+                else:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
 
-                success_count = sum(1 for r in wos_data if r.get("Status") == "Success")
-                status_text.success(f"✅ Finished processing {len(wos_data)} records!")
-                if success_count == 0:
-                    st.warning("**Cannot find DOI — no documents could be found.** Please check your WOS IDs (format like `WOS:001681025100006`) and that your API key has access to these documents.")
-                df_wos = pd.DataFrame(wos_data)
-                st.session_state["wos_df"] = df_wos
+                    wos_data = fetch_wos_data(wos_ids, progress_bar, status_text)
 
-        if "wos_df" in st.session_state:
-            df_show = st.session_state["wos_df"]
-            _gs_clicked = False
-            if SERPAPI_KEY and SERPAPI_KEY.strip():
-                st.markdown("---")
-                st.subheader("📊 Enrich with Google Scholar")
-                _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
-                with _gc2:
-                    _gs_clicked = st.button("🎓 Add Google Scholar citations", type="secondary", use_container_width=True)
-            elif not SERPAPI_AVAILABLE:
-                st.sidebar.caption("Install `google-search-results` for Google Scholar: pip install google-search-results")
-            else:
-                st.caption("Add a SerpAPI key in the sidebar to fetch Google Scholar citation counts by DOI.")
+                    success_count = sum(1 for r in wos_data if r.get("Status") == "Success")
+                    status_text.success(f"✅ Finished processing {len(wos_data)} records!")
+                    if success_count == 0:
+                        st.warning("**Cannot find DOI — no documents could be found.** Please check your WOS IDs (format like `WOS:001681025100006`) and that your API key has access to these documents.")
+                    df_wos = pd.DataFrame(wos_data)
+                    st.session_state["wos_df"] = df_wos
 
-            if _gs_clicked and SERPAPI_KEY and SERPAPI_KEY.strip() and SERPAPI_AVAILABLE:
-                dois = df_show["DOI"].astype(str).tolist()
-                total = len(dois)
-                progress_gs = st.progress(0)
-                status_gs = st.empty()
-                gs_citations = []
-                for i, doi in enumerate(dois):
-                    status_gs.text(f"Google Scholar {i+1}/{total}: {doi[:40]}...")
-                    cnt = fetch_google_scholar_citation(doi, SERPAPI_KEY)
-                    gs_citations.append(cnt if cnt is not None else "N/A")
-                    progress_gs.progress((i + 1) / total)
-                    time.sleep(0.3)
-                status_gs.success("✅ Google Scholar citations added.")
-                df_show = df_show.copy()
-                df_show["Google Scholar citations"] = gs_citations
-                st.session_state["wos_df"] = df_show
+            if "wos_df" in st.session_state and wos_search_mode == "Citation finder (by WOS ID)":
+                df_show = st.session_state["wos_df"]
+                _gs_clicked = False
+                if SERPAPI_KEY and SERPAPI_KEY.strip():
+                    st.markdown("---")
+                    st.subheader("📊 Enrich with Google Scholar")
+                    _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
+                    with _gc2:
+                        _gs_clicked = st.button("🎓 Add Google Scholar citations", type="secondary", use_container_width=True)
+                elif not SERPAPI_AVAILABLE:
+                    st.sidebar.caption("Install `google-search-results` for Google Scholar: pip install google-search-results")
+                else:
+                    st.caption("Add a SerpAPI key in the sidebar to fetch Google Scholar citation counts by DOI.")
 
-            if "Google Scholar citations" in df_show.columns or not _gs_clicked:
-                st.dataframe(st.session_state["wos_df"], use_container_width=True)
-                excel_data = to_excel(st.session_state["wos_df"])
+                if _gs_clicked and SERPAPI_KEY and SERPAPI_KEY.strip() and SERPAPI_AVAILABLE:
+                    dois = df_show["DOI"].astype(str).tolist()
+                    total = len(dois)
+                    progress_gs = st.progress(0)
+                    status_gs = st.empty()
+                    gs_citations = []
+                    for i, doi in enumerate(dois):
+                        status_gs.text(f"Google Scholar {i+1}/{total}: {doi[:40]}...")
+                        cnt = fetch_google_scholar_citation(doi, SERPAPI_KEY)
+                        gs_citations.append(cnt if cnt is not None else "N/A")
+                        progress_gs.progress((i + 1) / total)
+                        time.sleep(0.3)
+                    status_gs.success("✅ Google Scholar citations added.")
+                    df_show = df_show.copy()
+                    df_show["Google Scholar citations"] = gs_citations
+                    st.session_state["wos_df"] = df_show
+
+                if "Google Scholar citations" in df_show.columns or not _gs_clicked:
+                    st.dataframe(st.session_state["wos_df"], use_container_width=True)
+                    excel_data = to_excel(st.session_state["wos_df"])
+                    st.download_button(
+                        label="📥 Download results (.xlsx)",
+                        data=excel_data,
+                        file_name="wos_bulk_results.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="wos_download_btn",
+                    )
+
+        else:
+            st.markdown("Fetch **journal metrics** from Web of Science JCR using **ISSNs or journal titles** (one per line).")
+            raw_journal_text = st.text_area(
+                "📋 Enter ISSNs or journal titles (one per line):",
+                height=200,
+                placeholder="0000-0000\n1363-2434\nJournal of Marketing",
+                key="wos_journal_queries",
+            )
+            jcr_year = st.text_input("JCR year (e.g. 2019, 2023)", value="", key="wos_jcr_year")
+            edition_options = ["SCIE", "SSCI", "AHCI", "ESCI"]
+            selected_editions = st.multiselect(
+                "Edition filter (optional, Web of Science index):",
+                edition_options,
+                default=[],
+                help="Matches the Journals API `edition` parameter. Leave empty to include all editions.",
+            )
+
+            _j1, _j2, _j3 = st.columns([1, 1, 1])
+            with _j2:
+                _wos_journal_clicked = st.button("🔍 Search WOS Journals (JCR)", type="primary", use_container_width=True, key="wos_journal_btn")
+
+            if _wos_journal_clicked:
+                if not (WOS_JOURNAL_API_KEY and WOS_JOURNAL_API_KEY.strip()):
+                    st.warning("Please enter your **WOS Journal API key** in the sidebar to search journal metrics.")
+                else:
+                    queries = [line.strip() for line in raw_journal_text.split("\n") if line.strip()]
+                    if not queries:
+                        st.warning("Please enter at least one ISSN or journal title.")
+                    else:
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        # Default to latest JCR year (e.g. 2023) if blank, because jcrYear is required for metrics
+                        jcr_year_val = (jcr_year or "").strip() or "2023"
+                        edition_filter = ";".join(selected_editions) if selected_editions else None
+                        journal_rows = fetch_wos_journal_data(
+                            queries,
+                            WOS_JOURNAL_API_KEY.strip(),
+                            jcr_year_val,
+                            edition_filter,
+                            progress_bar,
+                            status_text,
+                        )
+                        status_text.success(f"✅ Finished processing {len(journal_rows)} records!")
+                        df_wos_journal = pd.DataFrame(journal_rows)
+                        st.session_state["wos_journal_df"] = df_wos_journal
+
+            if "wos_journal_df" in st.session_state and wos_search_mode == "Journal metrics (JCR by ISSN/title)":
+                st.dataframe(st.session_state["wos_journal_df"], use_container_width=True)
+                excel_jcr = to_excel(st.session_state["wos_journal_df"])
                 st.download_button(
-                    label="📥 Download results (.xlsx)",
-                    data=excel_data,
-                    file_name="wos_bulk_results.xlsx",
+                    label="📥 Download journal metrics (.xlsx)",
+                    data=excel_jcr,
+                    file_name="wos_journal_results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="wos_download_btn",
+                    key="wos_journal_download_btn",
                 )
 
 elif app_mode == "Scopus":
