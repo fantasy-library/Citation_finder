@@ -1342,7 +1342,7 @@ def _locked_view(reminder_message):
 # UNIFIED CITATION SEARCH (all three platforms)
 # ==========================================
 if app_mode == "Unified citation search":
-    st.title("🔍 Unified Citation Search")
+    _title_with_icon("Merge.png", "Unified Citation Search")
     st.markdown("Search citation counts from **Web of Science**, **Scopus**, and **Google Scholar** in one go.")
     st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
 
