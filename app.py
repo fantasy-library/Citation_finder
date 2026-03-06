@@ -5,7 +5,7 @@ import time
 import io
 import re
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 try:
     import streamlit.components.v1 as components
@@ -1045,6 +1045,113 @@ def _flatten_crossref_work(item):
     }
 
 
+def get_crossref_work_by_doi(doi, mailto=""):
+    """
+    Fetch a single work by DOI from Crossref (GET /works/{doi}).
+    Returns (list of one flattened item, 1, None) or ([], 0, error_message).
+    """
+    if not doi or not str(doi).strip():
+        return [], 0, "Please enter a DOI."
+    raw = str(doi).strip()
+    if raw.startswith("https://doi.org/"):
+        raw = raw.replace("https://doi.org/", "", 1)
+    if not raw.startswith("10."):
+        return [], 0, "DOI should start with 10. (e.g. 10.1016/j.jinorgbio.2021.111634)."
+    encoded_doi = quote(raw, safe="")
+    url = f"{CROSSREF_BASE_URL}/{encoded_doi}"
+    try:
+        response = requests.get(url, headers=_crossref_headers(mailto), timeout=30)
+        if response.status_code == 404:
+            return [], 0, "Not found — no record for this DOI."
+        if response.status_code != 200:
+            return [], 0, api_error_message("Crossref", response.status_code, response.text)
+        data = response.json()
+        msg = data.get("message")
+        if not msg or not isinstance(msg, dict):
+            return [], 0, "Invalid response from Crossref."
+        row = _flatten_crossref_work(msg)
+        return [row], 1, None
+    except requests.RequestException as e:
+        return [], 0, f"Request failed: {str(e)[:80]}"
+    except Exception as e:
+        return [], 0, f"Error: {str(e)[:80]}"
+
+
+def _normalize_crossref_doi_input(value: str) -> str:
+    """Normalize DOI input (accepts DOI, doi.org URL, or Crossref works URL)."""
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if low.startswith("doi:"):
+        raw = raw[4:].strip()
+        low = raw.lower()
+    if "api.crossref.org/works/" in low:
+        part = raw.split("api.crossref.org/works/", 1)[1]
+        part = part.split("?", 1)[0].split("#", 1)[0]
+        raw = unquote(part).strip()
+        low = raw.lower()
+    for prefix in ("https://doi.org/", "http://doi.org/"):
+        if low.startswith(prefix):
+            raw = raw[len(prefix):].strip()
+            break
+    return raw
+
+
+def bulk_crossref_lookup_by_dois(dois, mailto=""):
+    """
+    Bulk lookup via Crossref single-work endpoint (/works/{doi}).
+    Returns (rows, error_message). Each row includes a Status column.
+    """
+    rows = []
+    for d in (dois or []):
+        norm = _normalize_crossref_doi_input(d)
+        if not norm or not norm.startswith("10."):
+            row = _flatten_crossref_work({})
+            row["DOI"] = norm or (str(d).strip() if d is not None else "N/A") or "N/A"
+            row["Status"] = "Invalid DOI"
+            rows.append(row)
+            continue
+        encoded = quote(norm, safe="")
+        url = f"{CROSSREF_BASE_URL}/{encoded}"
+        try:
+            resp = requests.get(url, headers=_crossref_headers(mailto), timeout=30)
+            if resp.status_code == 404:
+                row = _flatten_crossref_work({})
+                row["DOI"] = norm
+                row["URL"] = f"https://doi.org/{norm}"
+                row["Status"] = "Not found"
+                rows.append(row)
+                continue
+            if resp.status_code != 200:
+                row = _flatten_crossref_work({})
+                row["DOI"] = norm
+                row["URL"] = f"https://doi.org/{norm}"
+                row["Status"] = api_error_message("Crossref", resp.status_code, getattr(resp, "text", None))
+                rows.append(row)
+                continue
+            data = resp.json()
+            msg = data.get("message")
+            row = _flatten_crossref_work(msg if isinstance(msg, dict) else {})
+            row["Status"] = "Success"
+            rows.append(row)
+        except requests.RequestException as e:
+            row = _flatten_crossref_work({})
+            row["DOI"] = norm
+            row["URL"] = f"https://doi.org/{norm}"
+            row["Status"] = f"Request failed: {str(e)[:80]}"
+            rows.append(row)
+        except Exception as e:
+            row = _flatten_crossref_work({})
+            row["DOI"] = norm
+            row["URL"] = f"https://doi.org/{norm}"
+            row["Status"] = f"Error: {str(e)[:80]}"
+            rows.append(row)
+    return rows, None
+
+
 def search_crossref_works(
     query=None,
     query_author=None,
@@ -1674,50 +1781,103 @@ elif app_mode == "Crossref":
             st.title("Crossref Search")
     else:
         st.title("Crossref Search")
-    st.markdown("Search **DOI** and metadata (title, authors, container, type, year, publisher) via the [Crossref Works API](https://api.crossref.org/). No API key required (optional mailto for polite pool).")
-    _cr_query = st.text_input("Search query (general)", placeholder="e.g. machine learning climate", key="crossref_query")
-    _cr_author = st.text_input("Author (query.author)", placeholder="e.g. Richard Feynman", key="crossref_author")
-    _cr_title = st.text_input("Title / bibliographic (query.bibliographic)", placeholder="e.g. Quantum Electrodynamics", key="crossref_title")
-    _cr_row1, _cr_row2 = st.columns(2)
-    with _cr_row1:
-        _cr_rows = st.number_input("Results per page", min_value=1, max_value=100, value=20, key="crossref_rows")
-        _cr_sort = st.selectbox(
-            "Sort by",
-            ["relevance", "score", "updated", "deposited", "indexed", "published", "published-online", "published-print", "issued", "is-referenced-by-count", "references-count", "created"],
-            key="crossref_sort",
-        )
-    with _cr_row2:
-        _cr_offset = st.number_input("Offset (skip N results)", min_value=0, value=0, key="crossref_offset")
-        _cr_mailto = st.text_input("Mailto (optional, for polite pool)", placeholder="your.email@example.com", key="crossref_mailto")
+    st.markdown("Search **DOI** and metadata (title, authors, journal, type, year, publisher, volume, issue, pages) via the [Crossref Works API](https://api.crossref.org/). No API key required (optional mailto for polite pool).")
 
-    _cr_btn_col1, _cr_btn_col2, _cr_btn_col3 = st.columns([1, 1, 1])
-    with _cr_btn_col2:
-        _cr_clicked = st.button("Search Crossref", type="primary", use_container_width=True, key="crossref_search_btn")
+    _cr_tab_lookup, _cr_tab_search = st.tabs(["🔎 Lookup by DOI(s)", "📄 Search by query"])
 
-    if _cr_clicked:
-        items, total, err = search_crossref_works(
-            query=_cr_query or None,
-            query_author=_cr_author or None,
-            query_title=_cr_title or None,
-            rows=_cr_rows,
-            offset=int(_cr_offset),
-            sort=_cr_sort,
-            mailto=(_cr_mailto or "").strip(),
+    with _cr_tab_lookup:
+        _cr_mailto_lookup = st.text_input("Mailto (optional, for polite pool)", placeholder="your.email@example.com", key="crossref_mailto_lookup")
+        _cr_single_doi = st.text_input(
+            "Single DOI",
+            placeholder="e.g. 10.1016/j.jinorgbio.2021.111634",
+            key="crossref_single_doi",
+            help="Accepts a DOI, a doi.org URL, or a Crossref works URL.",
         )
-        if err:
-            st.error(err)
-        else:
-            st.success(f"Found **{total}** result(s). Showing {len(items)} on this page.")
-            if items:
-                _cr_df = pd.DataFrame(items)
-                st.dataframe(_cr_df, width="stretch")
-                _cr_excel = to_excel(_cr_df)
-                st.download_button(
-                    label="📥 Download Crossref results (.xlsx)",
-                    data=_cr_excel,
-                    file_name="crossref_works_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="crossref_download_btn",
-                )
+        _cr_bulk = st.text_area(
+            "Bulk DOIs (one per line)",
+            height=180,
+            placeholder="10.1016/j.jinorgbio.2021.111634\n10.1038/nature12373\nhttps://doi.org/10.3390/cancers16050984",
+            key="crossref_bulk_dois",
+            help="Paste multiple DOIs (one per line). We'll fetch each one using Crossref's /works/{doi} endpoint.",
+        )
+        _cr_bulk_btn_col1, _cr_bulk_btn_col2, _cr_bulk_btn_col3 = st.columns([1, 1, 1])
+        with _cr_bulk_btn_col2:
+            _cr_bulk_clicked = st.button("Fetch DOI metadata", type="primary", use_container_width=True, key="crossref_bulk_btn")
+
+        if _cr_bulk_clicked:
+            lines = [l.strip() for l in (_cr_bulk or "").splitlines() if l.strip()]
+            dois = lines if lines else ([_cr_single_doi.strip()] if _cr_single_doi and _cr_single_doi.strip() else [])
+            if not dois:
+                st.warning("Please enter at least one DOI (single or bulk list).")
             else:
-                st.info("No works returned for this page. Try different terms or increase the offset.")
+                max_n = 200
+                if len(dois) > max_n:
+                    st.warning(f"Too many DOIs ({len(dois)}). Processing the first {max_n} only.")
+                    dois = dois[:max_n]
+                progress = st.progress(0)
+                status = st.empty()
+                out_rows = []
+                for i, d in enumerate(dois, 1):
+                    status.text(f"Crossref DOI {i}/{len(dois)}: {str(d)[:60]}...")
+                    rows, _ = bulk_crossref_lookup_by_dois([d], mailto=(_cr_mailto_lookup or "").strip())
+                    out_rows.extend(rows)
+                    progress.progress(i / len(dois))
+                    time.sleep(0.2)
+                status.success(f"✅ Finished processing {len(out_rows)} DOI(s).")
+                df = pd.DataFrame(out_rows)
+                st.dataframe(df, width="stretch")
+                st.download_button(
+                    label="📥 Download Crossref DOI results (.xlsx)",
+                    data=to_excel(df),
+                    file_name="crossref_doi_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="crossref_doi_download_btn",
+                )
+
+    with _cr_tab_search:
+        _cr_query = st.text_input("Search query (general)", placeholder="e.g. machine learning climate", key="crossref_query")
+        _cr_author = st.text_input("Author (query.author)", placeholder="e.g. Richard Feynman", key="crossref_author")
+        _cr_title = st.text_input("Title / bibliographic (query.bibliographic)", placeholder="e.g. Quantum Electrodynamics", key="crossref_title")
+        _cr_row1, _cr_row2 = st.columns(2)
+        with _cr_row1:
+            _cr_rows = st.number_input("Results per page", min_value=1, max_value=100, value=20, key="crossref_rows")
+            _cr_sort = st.selectbox(
+                "Sort by",
+                ["relevance", "score", "updated", "deposited", "indexed", "published", "published-online", "published-print", "issued", "is-referenced-by-count", "references-count", "created"],
+                key="crossref_sort",
+            )
+        with _cr_row2:
+            _cr_offset = st.number_input("Offset (skip N results)", min_value=0, value=0, key="crossref_offset")
+            _cr_mailto = st.text_input("Mailto (optional, for polite pool)", placeholder="your.email@example.com", key="crossref_mailto")
+
+        _cr_btn_col1, _cr_btn_col2, _cr_btn_col3 = st.columns([1, 1, 1])
+        with _cr_btn_col2:
+            _cr_clicked = st.button("Search Crossref", type="primary", use_container_width=True, key="crossref_search_btn")
+
+        if _cr_clicked:
+            items, total, err = search_crossref_works(
+                query=_cr_query or None,
+                query_author=_cr_author or None,
+                query_title=_cr_title or None,
+                rows=_cr_rows,
+                offset=int(_cr_offset),
+                sort=_cr_sort,
+                mailto=(_cr_mailto or "").strip(),
+            )
+            if err:
+                st.error(err)
+            else:
+                st.success(f"Found **{total}** result(s). Showing {len(items)} on this page.")
+                if items:
+                    _cr_df = pd.DataFrame(items)
+                    st.dataframe(_cr_df, width="stretch")
+                    _cr_excel = to_excel(_cr_df)
+                    st.download_button(
+                        label="📥 Download Crossref search results (.xlsx)",
+                        data=_cr_excel,
+                        file_name="crossref_works_results.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="crossref_download_btn",
+                    )
+                else:
+                    st.info("No works returned for this page. Try different terms or increase the offset.")
