@@ -5,6 +5,12 @@ import time
 import io
 import re
 from pathlib import Path
+from urllib.parse import quote
+
+try:
+    import streamlit.components.v1 as components
+except ImportError:
+    components = None
 
 try:
     from serpapi import GoogleSearch as SerpApiGoogleSearch
@@ -17,79 +23,199 @@ except ImportError:
 # ==========================================
 st.set_page_config(page_title="Academic Database Search", page_icon="📚", layout="wide")
 
-# Default Scopus institutional token from secrets (optional); user doesn't need to re-enter
+# Default from secrets (optional)
 try:
     _default_inst_token = st.secrets.get("SCOPUS_INST_TOKEN", "")
 except Exception:
     _default_inst_token = ""
 
-# Navigation first so we know which credentials to require
-st.sidebar.title("🧭 Navigation")
-# Show database icons (Streamlit radio only supports text labels, so we display icons above)
+# ==========================================
+# API KEYS – Template & file parsing
+# ==========================================
+ALLOWED_API_KEYS = ("WOS_API_KEY", "WOS_JOURNAL_API_KEY", "SCOPUS_API_KEY", "SCOPUS_INST_TOKEN", "SERPAPI_KEY")
+
+
+def get_api_keys_template_content():
+    """Return template file content for download."""
+    template_path = Path(__file__).resolve().parent / "api_keys_template.txt"
+    if template_path.exists():
+        return template_path.read_text(encoding="utf-8")
+    return """# API Keys Configuration
+# 1. Open this file in a text editor.
+# 2. Replace the empty values with your API keys. Leave a line empty to skip that platform.
+# 3. Save and upload the file in the app.
+# Do not share this file or commit it to version control.
+
+WOS_API_KEY=
+WOS_JOURNAL_API_KEY=
+SCOPUS_API_KEY=
+SCOPUS_INST_TOKEN=
+SERPAPI_KEY=
+"""
+
+
+def parse_api_keys_file(content, filename="uploaded file"):
+    """
+    Parse key=value (env-style) or simple KEY=value lines.
+    Returns (dict of key -> value, list of error/warning strings).
+    """
+    result = {}
+    errors = []
+    if not content or not isinstance(content, str):
+        errors.append("File is empty or not valid text.")
+        return result, errors
+    lines = content.strip().splitlines()
+    for i, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            errors.append(f"Line {i}: Invalid format. Use KEY=value (one key per line).")
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'").strip()
+        if not key:
+            errors.append(f"Line {i}: Missing key name. Use KEY=value.")
+            continue
+        if key not in ALLOWED_API_KEYS:
+            errors.append(f"Unknown key: '{key}'. Allowed: " + ", ".join(ALLOWED_API_KEYS))
+            continue
+        result[key] = value
+    if not result and not errors:
+        errors.append("No valid key=value lines found. Use one key per line: KEY_NAME=value")
+    return result, errors
+
+
+# Session state for API keys (from file upload or manual)
+if "api_keys" not in st.session_state:
+    st.session_state["api_keys"] = {}
+if "api_keys_errors" not in st.session_state:
+    st.session_state["api_keys_errors"] = []
+
+# ==========================================
+# SIDEBAR – Step 1: API keys (upload or manual)
+# ==========================================
 _icons_dir = Path(__file__).resolve().parent / "icons"
-try:
-    icon_cols = st.sidebar.columns(3)
-    icon_cols[0].image(str(_icons_dir / "WoS.png"), caption="Web of Science", use_container_width=True)
-    icon_cols[1].image(str(_icons_dir / "Scopus.png"), caption="Scopus", use_container_width=True)
-    icon_cols[2].image(str(_icons_dir / "Google.png"), caption="Google Scholar", use_container_width=True)
-except Exception:
-    pass  # If icons missing, navigation still works with radio only
-app_mode = st.sidebar.radio(
-    "Select Database API:",
-    ["Web of Science", "Scopus", "Google Scholar"],
-    format_func=lambda x: {"Web of Science": "📚 Web of Science", "Scopus": "📈 Scopus", "Google Scholar": "🎓 Google Scholar"}[x],
+st.sidebar.markdown("### 🔑 Step 1: API keys")
+template_content = get_api_keys_template_content()
+st.sidebar.download_button(
+    label="📥 Download template (.txt)",
+    data=template_content,
+    file_name="api_keys_template.txt",
+    mime="text/plain",
+    key="download_api_template",
+)
+uploaded_keys_file = st.sidebar.file_uploader(
+    "Upload API keys file",
+    type=["txt", "env"],
+    key="api_keys_upload",
+)
+if uploaded_keys_file is not None:
+    try:
+        raw = uploaded_keys_file.read().decode("utf-8")
+    except UnicodeDecodeError:
+        st.sidebar.error("File encoding error. Please save the file as UTF-8.")
+    except Exception as e:
+        st.sidebar.error(f"Could not read the file: {e}")
+    else:
+        parsed, parse_errors = parse_api_keys_file(raw, uploaded_keys_file.name)
+        if parse_errors:
+            for err in parse_errors:
+                st.sidebar.error(err)
+            st.session_state["api_keys_errors"] = parse_errors
+        else:
+            st.session_state["api_keys"] = {**st.session_state.get("api_keys", {}), **parsed}
+            st.session_state["api_keys_errors"] = []
+            st.sidebar.success("API keys loaded from file.")
+
+with st.sidebar.expander("✏️ Enter keys manually"):
+    with st.form("manual_api_keys_form", clear_on_submit=False):
+        manual_wos = st.text_input("WOS API key", type="password", placeholder="WOS key", key="manual_wos")
+        manual_wos_j = st.text_input("WOS Journal API key (optional)", type="password", placeholder="WOS Journal key", key="manual_wos_j")
+        manual_scopus = st.text_input("Scopus API key", type="password", placeholder="Scopus key", key="manual_scopus")
+        manual_inst = st.text_input("Scopus institutional token", type="password", placeholder="Institutional token", key="manual_inst")
+        manual_serp = st.text_input("SerpAPI key", type="password", placeholder="SerpAPI key", key="manual_serp")
+        submitted = st.form_submit_button("✓ Apply manual keys", type="primary")
+        if submitted:
+            keys = st.session_state.get("api_keys", {})
+            if manual_wos and manual_wos.strip():
+                keys["WOS_API_KEY"] = manual_wos.strip()
+            if manual_wos_j and manual_wos_j.strip():
+                keys["WOS_JOURNAL_API_KEY"] = manual_wos_j.strip()
+            if manual_scopus and manual_scopus.strip():
+                keys["SCOPUS_API_KEY"] = manual_scopus.strip()
+            if manual_inst and manual_inst.strip():
+                keys["SCOPUS_INST_TOKEN"] = manual_inst.strip()
+            if manual_serp and manual_serp.strip():
+                keys["SERPAPI_KEY"] = manual_serp.strip()
+            st.session_state["api_keys"] = keys
+            st.success("Manual keys applied.")
+    st.caption("Press **Enter** in any field to apply.")
+
+# Derive key variables from session (and secrets fallback)
+_keys = st.session_state.get("api_keys", {})
+WOS_API_KEY = _keys.get("WOS_API_KEY", "").strip()
+WOS_JOURNAL_API_KEY = (_keys.get("WOS_JOURNAL_API_KEY") or "").strip()
+SCOPUS_API_KEY = (_keys.get("SCOPUS_API_KEY") or "").strip()
+SCOPUS_INST_TOKEN = (_keys.get("SCOPUS_INST_TOKEN") or _default_inst_token or "").strip()
+SERPAPI_KEY = (_keys.get("SERPAPI_KEY") or "").strip()
+
+# Platform status (which keys are set)
+def _platform_status():
+    wos_ok = bool(WOS_API_KEY)
+    scopus_ok = bool(SCOPUS_API_KEY and SCOPUS_INST_TOKEN)
+    gs_ok = bool(SERPAPI_KEY)
+    return wos_ok, scopus_ok, gs_ok
+
+_wos_ok, _scopus_ok, _gs_ok = _platform_status()
+st.sidebar.markdown(
+    f"**Platforms:** WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}"
 )
 st.sidebar.markdown("---")
-st.sidebar.header("🔑 API configuration")
+st.sidebar.markdown("### 🧭 Step 2: Navigation")
+try:
+    icon_cols = st.sidebar.columns(3)
+    icon_cols[0].image(str(_icons_dir / "WoS.png"), caption="WOS", width="stretch")
+    icon_cols[1].image(str(_icons_dir / "Scopus.png"), caption="Scopus", width="stretch")
+    icon_cols[2].image(str(_icons_dir / "Google.png"), caption="Google Scholar", width="stretch")
+except Exception:
+    pass
+app_mode = st.sidebar.radio(
+    "Mode",
+    ["Unified citation search", "Web of Science", "Scopus", "Google Scholar", "Crossref"],
+    format_func=lambda x: {
+        "Unified citation search": "🔍 Unified (WOS + Scopus + Google Scholar)",
+        "Web of Science": "📚 Web of Science",
+        "Scopus": "📈 Scopus",
+        "Google Scholar": "🎓 Google Scholar",
+        "Crossref": "🔗 Crossref",
+    }[x],
+    key="app_mode_radio",
+)
 
-# Show only the API key field(s) for the selected database
-if app_mode == "Web of Science":
-    st.sidebar.info("⬇️ Enter your **WOS API key** below to get started.")
-    WOS_API_KEY = st.sidebar.text_input("WOS API key", type="password", placeholder="Your WOS API key")
-    WOS_JOURNAL_API_KEY = st.sidebar.text_input(
-        "WOS Journal API key (JCR / journals)",
-        type="password",
-        placeholder="Optional: separate WOS Journal API key",
-    )
-    SCOPUS_API_KEY = ""
-    SCOPUS_INST_TOKEN = _default_inst_token or ""
-    SERPAPI_KEY = ""
-elif app_mode == "Scopus":
-    st.sidebar.info("⬇️ Enter your **Scopus API key** and **institutional token** below.")
-    SCOPUS_API_KEY = st.sidebar.text_input("Scopus API key", type="password", placeholder="Your Scopus API key")
-    if _default_inst_token:
-        SCOPUS_INST_TOKEN = _default_inst_token
-    else:
-        SCOPUS_INST_TOKEN = st.sidebar.text_input("Scopus institutional token", type="password", placeholder="Your institutional token")
-    WOS_API_KEY = ""
-    SERPAPI_KEY = ""
-else:
-    st.sidebar.info("⬇️ Enter your **SerpAPI key** below to get started.")
-    SERPAPI_KEY = st.sidebar.text_input("SerpAPI key", type="password", placeholder="Your SerpAPI key")
-    WOS_API_KEY = ""
-    WOS_JOURNAL_API_KEY = ""
-    SCOPUS_API_KEY = ""
-    SCOPUS_INST_TOKEN = _default_inst_token or ""
-
-# Unlock search view only when API key (and token for Scopus) is entered
-if app_mode == "Google Scholar":
-    api_unlocked = bool(SERPAPI_KEY and SERPAPI_KEY.strip())
-    api_reminder = "Please enter your SerpAPI key in the sidebar to unlock the search."
+# Unlock logic per mode
+if app_mode == "Unified citation search":
+    api_unlocked = _wos_ok or _scopus_ok or _gs_ok
+    api_reminder = "Add at least one platform's API keys (Step 1) to unlock unified search."
+elif app_mode == "Google Scholar":
+    api_unlocked = bool(SERPAPI_KEY)
+    api_reminder = "Please add your SerpAPI key in Step 1 to unlock the search."
 elif app_mode == "Web of Science":
-    api_unlocked = bool(WOS_API_KEY and WOS_API_KEY.strip())
-    api_reminder = "Please enter your API key in the sidebar to unlock the search."
+    api_unlocked = bool(WOS_API_KEY)
+    api_reminder = "Please add your WOS API key in Step 1 to unlock the search."
 elif app_mode == "Scopus":
-    api_unlocked = bool(
-        SCOPUS_API_KEY and SCOPUS_API_KEY.strip()
-        and SCOPUS_INST_TOKEN and SCOPUS_INST_TOKEN.strip()
-    )
-    api_reminder = "Please enter your Scopus API key and institutional token in the sidebar to unlock the search."
+    api_unlocked = bool(SCOPUS_API_KEY and SCOPUS_INST_TOKEN)
+    api_reminder = "Please add your Scopus API key and institutional token in Step 1 to unlock the search."
+elif app_mode == "Crossref":
+    api_unlocked = True  # No API key required
+    api_reminder = ""
 else:
     api_unlocked = False
-    api_reminder = "Please enter your API key in the sidebar to unlock the search."
+    api_reminder = "Please add your API key in Step 1 to unlock the search view."
 
 if not api_unlocked:
-    st.sidebar.warning("Please enter your API key to unlock the search view.")
+    st.sidebar.warning(api_reminder)
 
 # ==========================================
 # API ERROR MESSAGES (user-friendly)
@@ -102,6 +228,8 @@ def api_error_message(service, status_code, response_body=None):
     if status_code == 401:
         return "Invalid or missing API key. Check your credentials."
     if status_code == 403:
+        if service and str(service).lower() == "scopus":
+            return "Access denied. Scopus requires both a valid **API key** and an **institutional token** (from your library). Check that both are correct and your institution has Scopus API access."
         return "Access denied. API key may be invalid or lack permission."
     if status_code == 404:
         return "Not found — no record for this identifier."
@@ -132,7 +260,9 @@ def serpapi_error_message(error_str):
 WOS_STARTER_BASE = "https://api.clarivate.com/apis/wos-starter/v1"
 
 
-def fetch_wos_data(wos_ids, progress_bar, status_text):
+def fetch_wos_data(wos_ids, progress_bar, status_text, wos_api_key=None):
+    """Fetch WOS document data. wos_api_key defaults to global WOS_API_KEY if not provided."""
+    key = (wos_api_key or "").strip() or WOS_API_KEY
     results = []
     total = len(wos_ids)
 
@@ -153,7 +283,7 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
         else:
             url = f"{WOS_STARTER_BASE}/documents/{wos_id}"
             params = None
-        headers = {"X-ApiKey": WOS_API_KEY}
+        headers = {"X-ApiKey": key}
 
         try:
             if params is None:
@@ -230,6 +360,9 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
                 if not isinstance(citations, list):
                     citations = []
 
+                types_raw = data.get("types") or []
+                types_list = types_raw if isinstance(types_raw, list) else [types_raw] if types_raw else []
+                doc_type = "; ".join(str(t) for t in types_list) or "N/A"
                 results.append({
                     "Unique WOS ID": wos_uid,
                     "DOI": doi,
@@ -237,7 +370,7 @@ def fetch_wos_data(wos_ids, progress_bar, status_text):
                     "Title": data.get('title', 'N/A'),
                     "Author Full Names": full_names or "N/A",
                     "Query (AU)": query,
-                    "Document Type": "; ".join(data.get('types', [])) or "N/A",
+                    "Document Type": doc_type,
                     "Source Title": source.get('sourceTitle', 'N/A'),
                     "Publish Year": source.get('publishYear', 'N/A'),
                     "Volume": source.get('volume', 'N/A'),
@@ -853,6 +986,112 @@ def fetch_google_scholar_citation(doi, api_key):
 
 
 # ==========================================
+# CROSSREF – Works search (DOI + metadata, no API key required)
+# ==========================================
+CROSSREF_BASE_URL = "https://api.crossref.org/works"
+
+
+def _crossref_headers(mailto=""):
+    """Headers for Crossref API; mailto enters the 'polite pool' for better performance."""
+    ua = "AcademicDatabaseSearch/1.0"
+    if mailto and str(mailto).strip():
+        ua += f" (mailto:{mailto.strip()})"
+    return {"User-Agent": ua}
+
+
+def _flatten_crossref_work(item):
+    """Turn one Crossref work item into a flat dict with DOI and key metadata."""
+    na = "N/A"
+    default = {"DOI": na, "Title": na, "Authors": na, "Journal": na, "Volume": na, "Issue": na, "Page": na, "Type": na, "Year": na, "Publisher": na, "URL": na}
+    if not isinstance(item, dict):
+        return default
+    doi = item.get("DOI") or na
+    title_list = item.get("title") or []
+    title = title_list[0] if title_list else na
+    authors_list = item.get("author") or []
+    author_parts = []
+    for a in authors_list[:20]:
+        if isinstance(a, dict):
+            name = a.get("name") or (f"{a.get('given', '')} {a.get('family', '')}".strip()) or "Unknown"
+            author_parts.append(name)
+    authors = "; ".join(author_parts) if author_parts else na
+    container_list = item.get("container-title") or []
+    journal = container_list[0] if container_list else na
+    def _opt_str(v):
+        if v is None or v == "":
+            return na
+        return str(v)
+    volume = _opt_str(item.get("volume"))
+    issue = _opt_str(item.get("issue"))
+    page = _opt_str(item.get("page"))
+    work_type = item.get("type") or na
+    issued = item.get("issued") or {}
+    date_parts = (issued.get("date-parts") or [[]])[0] if isinstance(issued.get("date-parts"), list) else []
+    year = date_parts[0] if date_parts and len(date_parts) > 0 else na
+    publisher = item.get("publisher") or na
+    url = item.get("URL") or (f"https://doi.org/{doi}" if doi != na else na)
+    return {
+        "DOI": doi,
+        "Title": title,
+        "Authors": authors,
+        "Journal": journal,
+        "Volume": volume,
+        "Issue": issue,
+        "Page": page,
+        "Type": work_type,
+        "Year": year,
+        "Publisher": publisher,
+        "URL": url,
+    }
+
+
+def search_crossref_works(
+    query=None,
+    query_author=None,
+    query_title=None,
+    query_bibliographic=None,
+    rows=20,
+    offset=0,
+    sort="relevance",
+    order="desc",
+    mailto="",
+):
+    """
+    Search Crossref works API. Returns (list of flattened items, total_results, error_message).
+    Uses query param and/or query.author, query.bibliographic (title/journal), etc.
+    """
+    rows_val = min(max(1, int(rows)), 1000)
+    query_parts = []
+    if query and str(query).strip():
+        query_parts.append(f"query={quote(str(query).strip())}")
+    if query_author and str(query_author).strip():
+        query_parts.append(f"query.author={quote(str(query_author).strip())}")
+    bib = (query_title or query_bibliographic or "").strip()
+    if bib:
+        query_parts.append(f"query.bibliographic={quote(bib)}")
+
+    if not query_parts:
+        return [], 0, "Please provide at least one search term (query, author, or title)."
+
+    url = f"{CROSSREF_BASE_URL}?{'&'.join(query_parts)}&rows={rows_val}&offset={offset}&sort={sort}&order={order}"
+
+    try:
+        response = requests.get(url, headers=_crossref_headers(mailto), timeout=30)
+        if response.status_code != 200:
+            return [], 0, api_error_message("Crossref", response.status_code, response.text)
+        data = response.json()
+        msg = data.get("message") or {}
+        items = msg.get("items") or []
+        total = msg.get("total-results") or 0
+        flattened = [_flatten_crossref_work(it) for it in items]
+        return flattened, total, None
+    except requests.RequestException as e:
+        return [], 0, f"Request failed: {str(e)[:80]}"
+    except Exception as e:
+        return [], 0, f"Error: {str(e)[:80]}"
+
+
+# ==========================================
 # EXCEL GENERATOR (In-Memory)
 # ==========================================
 def to_excel(df):
@@ -863,58 +1102,113 @@ def to_excel(df):
 
 
 # ==========================================
-# USER INTERFACE – Professional styling & icons
+# USER INTERFACE – Consistent, accessible styling
 # ==========================================
 st.markdown("""
 <style>
-    /* Main container & typography */
-    .main .block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1100px; }
-    h1 { font-weight: 700; letter-spacing: -0.02em; color: #1e293b; margin-bottom: 0.25rem !important; }
-    h2 { font-weight: 600; color: #334155; font-size: 1.25rem !important; margin-top: 1.5rem !important; }
-    h3 { font-weight: 600; color: #475569; font-size: 1.1rem !important; }
-    p { color: #64748b; }
+    /* ----- Main container & typography ----- */
+    .main .block-container { padding-top: 1.75rem; padding-bottom: 2.5rem; max-width: 1100px; }
+    .main .block-container > * { margin-bottom: 0.5rem; }
+    h1 { font-weight: 700; letter-spacing: -0.02em; color: #0f172a; margin-bottom: 0.35rem !important; font-size: 1.65rem !important; line-height: 1.3 !important; }
+    h2 { font-weight: 600; color: #1e293b; font-size: 1.2rem !important; margin-top: 1.25rem !important; margin-bottom: 0.5rem !important; line-height: 1.4 !important; }
+    h3 { font-weight: 600; color: #334155; font-size: 1.05rem !important; line-height: 1.4 !important; }
+    p { color: #475569; line-height: 1.5; margin-bottom: 0.5rem !important; }
 
-    /* Sidebar */
+    /* ----- Sidebar: consistent hierarchy & spacing ----- */
     [data-testid="stSidebar"] { background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); }
-    [data-testid="stSidebar"] .stMarkdown { color: #334155; }
-    [data-testid="stSidebar"] h1 { font-size: 1.35rem !important; }
-    [data-testid="stSidebar"] .stRadio label { font-weight: 500; }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"],
+    [data-testid="stSidebar"] .block-container { padding-top: 0 !important; }
+    /* Reduce sidebar header / logo spacer so Step 1 sits higher */
+    [data-testid="stSidebarHeader"] { min-height: 0 !important; padding-top: 0.5rem !important; padding-bottom: 0.25rem !important; }
+    [data-testid="stLogoSpacer"] { height: 0 !important; min-height: 0 !important; display: none !important; }
+    [data-testid="stSidebar"] .stMarkdown { color: #334155; line-height: 1.45; }
+    [data-testid="stSidebar"] h1 { font-size: 1.2rem !important; font-weight: 600 !important; color: #1e293b !important; margin-bottom: 0.5rem !important; }
+    [data-testid="stSidebar"] h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #0f172a !important; margin-top: 0.75rem !important; margin-bottom: 0.5rem !important; }
+    [data-testid="stSidebar"] .stRadio label { font-weight: 500; font-size: 0.95rem !important; }
+    [data-testid="stSidebar"] .stExpander { border-radius: 8px; border: 1px solid #e2e8f0; }
+    [data-testid="stSidebar"] .stExpander summary { font-weight: 600; color: #334155; padding: 0.4rem 0; }
 
-    /* Cards / sections */
-    .stTabs [data-baseweb="tab-list"] { gap: 0.5rem; margin-bottom: 1.5rem; }
-    .stTabs [data-baseweb="tab"] { padding: 0.6rem 1.2rem; font-weight: 600; border-radius: 8px; }
+    /* ----- Labels: consistent, readable ----- */
+    [data-testid="stWidgetLabel"] { font-weight: 600 !important; color: #334155 !important; font-size: 0.95rem !important; }
+    .stTextArea label, .stTextInput label { font-weight: 600 !important; color: #334155 !important; }
+
+    /* ----- Cards / sections ----- */
+    .stTabs [data-baseweb="tab-list"] { gap: 0.5rem; margin-bottom: 1.25rem; }
+    .stTabs [data-baseweb="tab"] { padding: 0.6rem 1.2rem; font-weight: 600; border-radius: 8px; font-size: 0.95rem !important; }
     .stTabs [aria-selected="true"] { background: #0ea5e9 !important; color: white !important; }
 
-    /* Metrics */
+    /* ----- Metrics ----- */
     [data-testid="stMetric"] { background: #f8fafc; padding: 1rem 1.25rem; border-radius: 10px; border: 1px solid #e2e8f0; }
     [data-testid="stMetricLabel"] { font-size: 0.8rem !important; font-weight: 600 !important; color: #64748b !important; text-transform: uppercase; letter-spacing: 0.03em; }
     [data-testid="stMetricValue"] { font-size: 1.5rem !important; font-weight: 700 !important; color: #0f172a !important; }
 
-    /* Buttons */
-    .stButton > button { padding: 0.6rem 1.5rem; font-size: 1rem; font-weight: 600; border-radius: 8px; transition: transform 0.15s ease, box-shadow 0.15s ease; }
+    /* ----- Buttons: consistent size and focus ----- */
+    .stButton > button { padding: 0.6rem 1.5rem; font-size: 0.95rem; font-weight: 600; border-radius: 8px; transition: transform 0.15s ease, box-shadow 0.15s ease; min-height: 2.5rem; }
     .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(14, 165, 233, 0.25); }
+    .stButton > button:focus-visible { outline: 2px solid #0ea5e9; outline-offset: 2px; }
     .stButton > button[kind="primary"],
     .stButton > button[kind="primary"] * { background: transparent !important; color: white !important; border: none !important; }
     .stButton > button[kind="primary"] { background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%) !important; }
+    [data-testid="stFormSubmitButton"] button,
+    [data-testid="stFormSubmitButton"] button * { color: white !important; }
+    [data-testid="stFormSubmitButton"] button:focus-visible { outline: 2px solid #0ea5e9; outline-offset: 2px; }
 
-    /* Inputs */
-    .stTextInput input, .stTextArea textarea { border-radius: 8px; border: 1px solid #e2e8f0; }
-    .stTextInput input:focus, .stTextArea textarea:focus { border-color: #0ea5e9; box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.2); }
+    /* ----- Inputs: consistent box and focus ----- */
+    .stTextInput input, .stTextArea textarea { border-radius: 8px; border: 1px solid #e2e8f0; font-size: 0.95rem !important; line-height: 1.5 !important; }
+    .stTextInput input:focus, .stTextArea textarea:focus { border-color: #0ea5e9; box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.2); outline: none; }
+    .stTextArea textarea { min-height: 8rem; }
 
-    /* Dataframe */
+    /* ----- Dataframe ----- */
     .stDataFrame { border-radius: 10px; overflow: hidden; border: 1px solid #e2e8f0; }
 
-    /* Alerts & captions */
-    .stAlert { border-radius: 8px; }
-    .stCaption { color: #94a3b8 !important; font-size: 0.85rem !important; }
+    /* ----- Alerts & captions ----- */
+    .stAlert { border-radius: 8px; border: 1px solid transparent; }
+    .stCaption { color: #64748b !important; font-size: 0.875rem !important; line-height: 1.45 !important; margin-top: 0.25rem !important; }
 
-    /* Divider */
-    hr { margin: 1.5rem 0 !important; border-color: #e2e8f0 !important; }
+    /* ----- Divider ----- */
+    hr { margin: 1.25rem 0 !important; border-color: #e2e8f0 !important; }
+
+    /* ----- Hide file uploader limit text ----- */
+    [data-testid="stFileUploader"] small,
+    [data-testid="stFileUploader"] [class*="caption"],
+    [data-testid="stFileUploader"] p,
+    [data-testid="stFileUploader"] [class*="help"],
+    [data-testid="stFileUploader"] [class*="limit"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# Hide file uploader "Limit 200MB per file • TXT, ENV" via JS (runs in iframe, modifies parent DOM)
+_hide_uploader_limit_script = """
+<script>
+(function() {
+  var doc = window.parent && window.parent.document ? window.parent.document : document;
+  function hideLimit() {
+    try {
+      var uploaders = doc.querySelectorAll('[data-testid="stFileUploader"]');
+      for (var i = 0; i < uploaders.length; i++) {
+        var walk = function(node) {
+          if (node.nodeType === Node.TEXT_NODE && node.textContent && /Limit|200MB|per file|TXT.*ENV/.test(node.textContent)) {
+            if (node.parentElement) node.parentElement.style.setProperty('display', 'none', 'important');
+            return;
+          }
+          for (var j = 0; j < node.childNodes.length; j++) walk(node.childNodes[j]);
+        };
+        walk(uploaders[i]);
+      }
+    } catch (e) {}
+  }
+  if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', hideLimit);
+  else hideLimit();
+  setTimeout(hideLimit, 400);
+  setTimeout(hideLimit, 1200);
+})();
+</script>
+"""
+if components is not None:
+    components.html(_hide_uploader_limit_script, height=0)
+
 st.sidebar.markdown("---")
-st.sidebar.caption("🔐 Enter only the API key(s) for the selected database. Keys are not stored on disk.")
+st.sidebar.caption("🔐 Keys are used only in this session and are not stored on disk.")
 
 
 def _title_with_icon(icon_filename, title_text):
@@ -923,7 +1217,7 @@ def _title_with_icon(icon_filename, title_text):
     if icon_path.exists():
         col_icon, col_title = st.columns([0.08, 0.92])
         with col_icon:
-            st.image(str(icon_path), use_container_width=True)
+            st.image(str(icon_path), width="stretch")
         with col_title:
             st.title(title_text)
     else:
@@ -931,13 +1225,150 @@ def _title_with_icon(icon_filename, title_text):
 
 
 def _locked_view(reminder_message):
-    """Show locked state: reminder to enter API key (icon only in title)."""
+    """Show locked state: reminder to enter API key."""
     st.markdown("<br>", unsafe_allow_html=True)
-    st.info(f"🔒 **{reminder_message}**")
-    st.caption("Enter your API key in the **sidebar** to unlock the search view.")
+    st.info(f"🔒 {reminder_message}")
+    st.caption("Add your API keys in **Step 1** in the sidebar to unlock the search view.")
 
 
-if app_mode == "Web of Science":
+# ==========================================
+# UNIFIED CITATION SEARCH (all three platforms)
+# ==========================================
+if app_mode == "Unified citation search":
+    st.title("🔍 Unified Citation Search")
+    st.markdown("Search citation counts from **Web of Science**, **Scopus**, and **Google Scholar** in one go.")
+    st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
+
+    if not api_unlocked:
+        _locked_view(api_reminder)
+    else:
+        raw_input = st.text_area(
+            "📋 Paste DOIs (one per line)",
+            height=200,
+            placeholder="10.3390/cancers16050984\n10.1038/s41593-021-00969-4",
+            key="unified_input",
+        )
+        _uc1, _uc2, _uc3 = st.columns([1, 1, 1])
+        with _uc2:
+            unified_clicked = st.button("🔍 Search all platforms", type="primary", use_container_width=True, key="unified_btn")
+
+        if unified_clicked:
+            lines = [line.strip() for line in raw_input.split("\n") if line.strip()]
+            if not lines:
+                st.warning("Please enter at least one DOI or WOS ID.")
+            else:
+                # Resolve WOS IDs to DOIs where needed; build list of (user_id, doi or None)
+                identifiers = []
+                dois_to_fetch = set()
+                for line in lines:
+                    if line.lower().startswith("10."):
+                        identifiers.append((line, line))
+                        dois_to_fetch.add(line)
+                    else:
+                        identifiers.append((line, None))  # WOS ID, resolve later
+
+                # Resolve WOS IDs to DOIs if we have WOS key
+                if _wos_ok and any(id_[1] is None for id_ in identifiers):
+                    wos_ids_to_resolve = [id_[0] for id_ in identifiers if id_[1] is None]
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    wos_resolve = fetch_wos_data(wos_ids_to_resolve, progress_bar, status_text, wos_api_key=WOS_API_KEY)
+                    resolved_dois = {}
+                    for r in wos_resolve:
+                        uid = r.get("Unique WOS ID", "")
+                        doi = r.get("DOI", "N/A")
+                        if uid and doi and doi != "N/A":
+                            resolved_dois[uid] = doi
+                    new_identifiers = []
+                    for user_id, doi in identifiers:
+                        if doi is not None:
+                            new_identifiers.append((user_id, doi))
+                        else:
+                            resolved = resolved_dois.get(user_id)
+                            new_identifiers.append((user_id, resolved if resolved else user_id))
+                    identifiers = new_identifiers
+                    for _, d in identifiers:
+                        if d and d != "N/A" and str(d).startswith("10."):
+                            dois_to_fetch.add(d)
+                else:
+                    for user_id, doi in identifiers:
+                        if doi and str(doi).startswith("10."):
+                            dois_to_fetch.add(doi)
+                    if not dois_to_fetch and any(id_[1] for id_ in identifiers):
+                        dois_to_fetch = {id_[1] for id_ in identifiers if id_[1] and str(id_[1]).startswith("10.")}
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                total_steps = len(identifiers) * ( (_wos_ok and 1 or 0) + (_scopus_ok and 1 or 0) + (_gs_ok and 1 or 0) )
+                if total_steps == 0:
+                    total_steps = 1
+                step = 0
+                unified_rows = []
+                for user_id, doi in identifiers:
+                    row = {
+                        "Identifier": user_id,
+                        "DOI": doi if doi else "N/A",
+                        "Title": "N/A",
+                        "WOS Citation Count": "N/A",
+                        "Scopus Total Citations": "N/A",
+                        "Scopus Excl. self": "N/A",
+                        "Google Scholar citations": "N/A",
+                        "Status (WOS)": "N/A",
+                        "Status (Scopus)": "N/A",
+                        "Status (Google Scholar)": "N/A",
+                    }
+                    effective_doi = doi if doi and str(doi).startswith("10.") else None
+                    if _wos_ok and effective_doi:
+                        status_text.text(f"WOS: {user_id[:50]}...")
+                        wos_list = fetch_wos_data([effective_doi], progress_bar, status_text, wos_api_key=WOS_API_KEY)
+                        if wos_list:
+                            w = wos_list[0]
+                            row["Title"] = w.get("Title", "N/A")
+                            row["WOS Citation Count"] = w.get("Citation Count", "N/A")
+                            row["Status (WOS)"] = w.get("Status", "N/A")
+                        step += 1
+                        progress_bar.progress(min(step / total_steps, 1.0))
+                    if _scopus_ok and effective_doi:
+                        status_text.text(f"Scopus: {user_id[:50]}...")
+                        try:
+                            s = process_doi_scopus(effective_doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                            row["Title"] = row["Title"] if row["Title"] != "N/A" else s.get("Title", "N/A")
+                            row["Scopus Total Citations"] = s.get("Total Citations", "N/A")
+                            row["Scopus Excl. self"] = s.get("Exclude self-citations", "N/A")
+                            row["Status (Scopus)"] = s.get("Status", "N/A")
+                        except Exception:
+                            row["Status (Scopus)"] = "Error"
+                        step += 1
+                        progress_bar.progress(min(step / total_steps, 1.0))
+                        time.sleep(0.5)
+                    if _gs_ok and effective_doi:
+                        status_text.text(f"Google Scholar: {user_id[:50]}...")
+                        gs = fetch_google_scholar_result(effective_doi, SERPAPI_KEY)
+                        row["Title"] = row["Title"] if row["Title"] != "N/A" else gs.get("Title", "N/A")
+                        row["Google Scholar citations"] = gs.get("Google Scholar citations", "N/A")
+                        row["Status (Google Scholar)"] = gs.get("Status", "N/A")
+                        step += 1
+                        progress_bar.progress(min(step / total_steps, 1.0))
+                        time.sleep(0.3)
+                    unified_rows.append(row)
+                status_text.success(f"✅ Finished processing {len(unified_rows)} records!")
+                df_unified = pd.DataFrame(unified_rows)
+                st.session_state["unified_df"] = df_unified
+
+        if "unified_df" in st.session_state:
+            df_show = st.session_state["unified_df"]
+            st.divider()
+            st.dataframe(df_show, width="stretch")
+            excel_data = to_excel(df_show)
+            st.download_button(
+                label="📥 Download results (.xlsx)",
+                data=excel_data,
+                file_name="unified_citation_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="unified_download_btn",
+            )
+
+elif app_mode == "Web of Science":
     _title_with_icon("WoS.png", "Web of Science (includes SCIE, SSCI and CPCI) Citation Finder")
 
     if not api_unlocked:
@@ -946,18 +1377,16 @@ if app_mode == "Web of Science":
         wos_search_mode = st.radio(
             "Search type:",
             ["Citation finder (by WOS ID or DOI)", "Journal metrics (JCR by ISSN/title)"],
+            format_func=lambda x: "📄 Citation finder (by WOS ID or DOI)" if x == "Citation finder (by WOS ID or DOI)" else "📰 Journal metrics (JCR by ISSN/title)",
             horizontal=True,
             key="wos_mode",
         )
 
         if wos_search_mode == "Citation finder (by WOS ID or DOI)":
-            st.markdown("Fetch article metadata, full authors, and citation counts using **WOS IDs (UIDs)**. DOIs are also accepted.")
-            st.caption(
-                "For best results, paste Web of Science UIDs (e.g. `WOS:000267144200002`). "
-                "You may also paste DOIs (e.g. `10.3390/cancers16050984`) when UIDs are not available."
-            )
+            st.markdown("Fetch article metadata, authors, and citation counts by **WOS ID** or **DOI**.")
+            st.caption("Paste one identifier per line (e.g. `WOS:000267144200002` or `10.3390/cancers16050984`).")
             raw_wos_text = st.text_area(
-                "📋 Paste WOS IDs (recommended) or DOIs (one per line):",
+                "📋 Paste WOS IDs or DOIs (one per line)",
                 height=200,
                 placeholder="WOS:001681025100006\n10.3390/cancers16050984",
             )
@@ -986,11 +1415,12 @@ if app_mode == "Web of Science":
                     df_wos = pd.DataFrame(wos_data)
                     st.session_state["wos_df"] = df_wos
 
-            if "wos_df" in st.session_state and wos_search_mode == "Citation finder (by WOS ID)":
+            if "wos_df" in st.session_state and wos_search_mode == "Citation finder (by WOS ID or DOI)":
                 df_show = st.session_state["wos_df"]
+                st.divider()
                 _gs_clicked = False
                 if SERPAPI_KEY and SERPAPI_KEY.strip():
-                    st.markdown("---")
+                    st.divider()
                     st.subheader("📊 Enrich with Google Scholar")
                     _gc1, _gc2, _gc3 = st.columns([1, 1, 1])
                     with _gc2:
@@ -1018,7 +1448,7 @@ if app_mode == "Web of Science":
                     st.session_state["wos_df"] = df_show
 
                 if "Google Scholar citations" in df_show.columns or not _gs_clicked:
-                    st.dataframe(st.session_state["wos_df"], use_container_width=True)
+                    st.dataframe(st.session_state["wos_df"], width="stretch")
                     excel_data = to_excel(st.session_state["wos_df"])
                     st.download_button(
                         label="📥 Download results (.xlsx)",
@@ -1029,9 +1459,10 @@ if app_mode == "Web of Science":
                     )
 
         else:
-            st.markdown("Fetch **journal metrics** from Web of Science JCR using **ISSNs or journal titles** (one per line).")
+            st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**.")
+            st.caption("Enter one ISSN or title per line.")
             raw_journal_text = st.text_area(
-                "📋 Enter ISSNs or journal titles (one per line):",
+                "📋 Enter ISSNs or journal titles (one per line)",
                 height=200,
                 placeholder="0000-0000\n1363-2434\nJournal of Marketing",
                 key="wos_journal_queries",
@@ -1075,7 +1506,8 @@ if app_mode == "Web of Science":
                         st.session_state["wos_journal_df"] = df_wos_journal
 
             if "wos_journal_df" in st.session_state and wos_search_mode == "Journal metrics (JCR by ISSN/title)":
-                st.dataframe(st.session_state["wos_journal_df"], use_container_width=True)
+                st.divider()
+                st.dataframe(st.session_state["wos_journal_df"], width="stretch")
                 excel_jcr = to_excel(st.session_state["wos_journal_df"])
                 st.download_button(
                     label="📥 Download journal metrics (.xlsx)",
@@ -1086,20 +1518,22 @@ if app_mode == "Web of Science":
                 )
 
 elif app_mode == "Scopus":
-    _title_with_icon("Scopus.png", "Scopus Citation finder")
+    _title_with_icon("Scopus.png", "Scopus Citation Finder")
     if not api_unlocked:
         _locked_view(api_reminder)
     else:
         scopus_search_mode = st.radio(
             "Search type:",
             ["Citation finder (by DOI)", "Journal metrics (by ISSN)"],
+            format_func=lambda x: "📄 Citation finder (by DOI)" if x == "Citation finder (by DOI)" else "📰 Journal metrics (by ISSN)",
             horizontal=True,
             key="scopus_mode",
         )
 
         if scopus_search_mode == "Citation finder (by DOI)":
-            st.markdown("Fetch **citation metrics** (total and exclude self-citations) for articles using DOIs. Paste DOIs or upload a file.")
-            raw_dois = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
+            st.markdown("Fetch **citation metrics** (total and exclude self-citations) by **DOI**.")
+            st.caption("Paste DOIs (one per line) or upload a CSV/Excel file with a DOI column.")
+            raw_dois = st.text_area("📋 Paste DOIs (one per line)", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
             uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
 
             _c1, _c2, _c3 = st.columns([1, 1, 1])
@@ -1140,7 +1574,8 @@ elif app_mode == "Scopus":
                     st.session_state["scopus_df"] = df_results
 
             if "scopus_df" in st.session_state and scopus_search_mode == "Citation finder (by DOI)":
-                st.dataframe(st.session_state["scopus_df"], use_container_width=True)
+                st.divider()
+                st.dataframe(st.session_state["scopus_df"], width="stretch")
                 excel_data = to_excel(st.session_state["scopus_df"])
                 st.download_button(
                     label="📥 Download results (.xlsx)",
@@ -1151,8 +1586,9 @@ elif app_mode == "Scopus":
                 )
 
         else:
-            st.markdown("Fetch **journal metrics** (Journal Title, CiteScore, SNIP, SJR, Subject Areas, etc.) using **ISSNs**. One ISSN per line.")
-            raw_issn_text = st.text_area("📋 Enter ISSN numbers (one per line):", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
+            st.markdown("Fetch **journal metrics** (CiteScore, SNIP, SJR, subject areas) by **ISSN**.")
+            st.caption("Enter one ISSN per line (with or without hyphen).")
+            raw_issn_text = st.text_area("📋 Enter ISSNs (one per line)", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
             _j1, _j2, _j3 = st.columns([1, 1, 1])
             with _j2:
@@ -1172,7 +1608,8 @@ elif app_mode == "Scopus":
                     st.session_state["scopus_journal_df"] = df_journal
 
             if "scopus_journal_df" in st.session_state:
-                st.dataframe(st.session_state["scopus_journal_df"], use_container_width=True)
+                st.divider()
+                st.dataframe(st.session_state["scopus_journal_df"], width="stretch")
                 excel_journal = to_excel(st.session_state["scopus_journal_df"])
                 st.download_button(
                     label="📥 Download journal metrics (.xlsx)",
@@ -1183,15 +1620,16 @@ elif app_mode == "Scopus":
                 )
 
 elif app_mode == "Google Scholar":
-    _title_with_icon("Google.png", "Google Scholar Citation finder")
-    st.markdown("Fetch **citation counts** by DOI using SerpAPI. Paste one DOI per line.")
+    _title_with_icon("Google.png", "Google Scholar Citation Finder")
+    st.markdown("Fetch **citation counts** by **DOI** (via SerpAPI).")
+    st.caption("Paste one DOI per line.")
 
     if not api_unlocked:
         _locked_view(api_reminder)
     elif not SERPAPI_AVAILABLE:
         st.warning("⚠️ Install the SerpAPI client: **pip install google-search-results**")
     else:
-        raw_doi_text = st.text_area("📋 Paste DOIs here (one per line):", height=200, placeholder="10.1038/s41593-021-00969-4\n10.1109/TMI.2025.3605219")
+        raw_doi_text = st.text_area("📋 Paste DOIs (one per line)", height=200, placeholder="10.1038/s41593-021-00969-4\n10.1109/TMI.2025.3605219")
 
         _c1, _c2, _c3 = st.columns([1, 1, 1])
         with _c2:
@@ -1214,6 +1652,7 @@ elif app_mode == "Google Scholar":
                     time.sleep(0.3)
                 status_gs.success(f"✅ Finished processing {len(gs_results)} records!")
                 df_gs = pd.DataFrame(gs_results)
+                st.divider()
                 st.dataframe(df_gs)
                 excel_data = to_excel(df_gs)
                 st.download_button(
@@ -1223,3 +1662,62 @@ elif app_mode == "Google Scholar":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="gs_download_btn",
                 )
+
+elif app_mode == "Crossref":
+    _cr_icon_path = _icons_dir / "Crossref.png"
+    if _cr_icon_path.exists():
+        _cr_icon_col, _cr_title_col = st.columns([0.22, 0.78])  # larger icon for prominence
+        with _cr_icon_col:
+            st.image(str(_cr_icon_path), width="stretch")
+            st.caption("Metadata from Crossref")
+        with _cr_title_col:
+            st.title("Crossref Search")
+    else:
+        st.title("Crossref Search")
+    st.markdown("Search **DOI** and metadata (title, authors, container, type, year, publisher) via the [Crossref Works API](https://api.crossref.org/). No API key required (optional mailto for polite pool).")
+    _cr_query = st.text_input("Search query (general)", placeholder="e.g. machine learning climate", key="crossref_query")
+    _cr_author = st.text_input("Author (query.author)", placeholder="e.g. Richard Feynman", key="crossref_author")
+    _cr_title = st.text_input("Title / bibliographic (query.bibliographic)", placeholder="e.g. Quantum Electrodynamics", key="crossref_title")
+    _cr_row1, _cr_row2 = st.columns(2)
+    with _cr_row1:
+        _cr_rows = st.number_input("Results per page", min_value=1, max_value=100, value=20, key="crossref_rows")
+        _cr_sort = st.selectbox(
+            "Sort by",
+            ["relevance", "score", "updated", "deposited", "indexed", "published", "published-online", "published-print", "issued", "is-referenced-by-count", "references-count", "created"],
+            key="crossref_sort",
+        )
+    with _cr_row2:
+        _cr_offset = st.number_input("Offset (skip N results)", min_value=0, value=0, key="crossref_offset")
+        _cr_mailto = st.text_input("Mailto (optional, for polite pool)", placeholder="your.email@example.com", key="crossref_mailto")
+
+    _cr_btn_col1, _cr_btn_col2, _cr_btn_col3 = st.columns([1, 1, 1])
+    with _cr_btn_col2:
+        _cr_clicked = st.button("Search Crossref", type="primary", use_container_width=True, key="crossref_search_btn")
+
+    if _cr_clicked:
+        items, total, err = search_crossref_works(
+            query=_cr_query or None,
+            query_author=_cr_author or None,
+            query_title=_cr_title or None,
+            rows=_cr_rows,
+            offset=int(_cr_offset),
+            sort=_cr_sort,
+            mailto=(_cr_mailto or "").strip(),
+        )
+        if err:
+            st.error(err)
+        else:
+            st.success(f"Found **{total}** result(s). Showing {len(items)} on this page.")
+            if items:
+                _cr_df = pd.DataFrame(items)
+                st.dataframe(_cr_df, width="stretch")
+                _cr_excel = to_excel(_cr_df)
+                st.download_button(
+                    label="📥 Download Crossref results (.xlsx)",
+                    data=_cr_excel,
+                    file_name="crossref_works_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="crossref_download_btn",
+                )
+            else:
+                st.info("No works returned for this page. Try different terms or increase the offset.")

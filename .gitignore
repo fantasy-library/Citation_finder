@@ -1,5 +1,7 @@
 # Streamlit secrets (API keys – never commit)
 .streamlit/secrets.toml
+# Filled API keys file (template is safe to commit)
+api_keys.txt
 
 # Python
 __pycache__/

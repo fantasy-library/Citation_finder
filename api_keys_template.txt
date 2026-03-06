@@ -1,0 +1,11 @@
+# API Keys Configuration
+# 1. Open this file in a text editor (Notepad, etc.).
+# 2. Replace the empty values with your API keys. Leave a line empty to skip that platform.
+# 3. Save the file and upload it in the app.
+# Do not share this file or commit it to version control.
+
+WOS_API_KEY=
+WOS_JOURNAL_API_KEY=
+SCOPUS_API_KEY=
+SCOPUS_INST_TOKEN=
+SERPAPI_KEY=
