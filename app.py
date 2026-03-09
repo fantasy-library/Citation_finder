@@ -1463,14 +1463,13 @@ if app_mode == "Unified citation search":
                 placeholder="2161-797X\n1755-0645\n0309-0566",
                 key="unified_issn_input",
             )
-            _ucy = max(2020, time.gmtime().tm_year - 2)
-            unified_scopus_year = st.selectbox(
-                "Scopus CiteScore year (optional)",
-                ["Latest"] + [str(y) for y in range(_ucy, 2019, -1)],
-                help="Choose a specific year or Latest for current metric.",
+            unified_scopus_year = st.text_input(
+                "Scopus CiteScore year (leave blank for latest)",
+                value="",
+                placeholder="2024",
                 key="unified_scopus_citescore_year",
             )
-            unified_citescore_year_param = None if unified_scopus_year == "Latest" else unified_scopus_year
+            unified_citescore_year_param = (unified_scopus_year or "").strip() or None
 
             _uj1, _uj2, _uj3 = st.columns([1, 1, 1])
             with _uj2:
@@ -1886,14 +1885,13 @@ elif app_mode == "Scopus":
             st.caption("Enter one ISSN per line (with or without hyphen).")
             raw_issn_text = st.text_area("📋 Enter ISSNs (one per line)", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
-            _scy = max(2020, time.gmtime().tm_year - 2)
-            scopus_citescore_year = st.selectbox(
-                "CiteScore year (optional)",
-                ["Latest"] + [str(y) for y in range(_scy, 2019, -1)],
-                help="Choose a specific year or Latest for current metric.",
+            scopus_citescore_year = st.text_input(
+                "CiteScore year (leave blank for latest)",
+                value="",
+                placeholder="2024",
                 key="scopus_citescore_year",
             )
-            citescore_year_param = None if scopus_citescore_year == "Latest" else scopus_citescore_year
+            citescore_year_param = (scopus_citescore_year or "").strip() or None
 
             _j1, _j2, _j3 = st.columns([1, 1, 1])
             with _j2:
