@@ -1449,8 +1449,9 @@ if app_mode == "Unified citation search":
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     if WOS_JOURNAL_API_KEY:
-                        # Use current year by default (most up-to-date JCR report)
-                        jcr_year_val = str(time.gmtime().tm_year)
+                        # Default: previous year, but not before 2024 (JCR lags; advances as time goes by)
+                        _y = time.gmtime().tm_year
+                        jcr_year_val = str(max(2024, _y - 1))
                         status_text.text("Fetching WoS (JCR) journal metrics...")
                         # WOS Journals API expects ISSN in hyphenated form (e.g. 1476-4660)
                         wos_queries = [format_issn_for_wos(issn) for issn in clean_issns]
@@ -1724,8 +1725,8 @@ elif app_mode == "Web of Science":
                 placeholder="0000-0000\n1363-2434\nJournal of Marketing",
                 key="wos_journal_queries",
             )
-            _current_year = str(time.gmtime().tm_year)
-            jcr_year = st.text_input("JCR year (leave blank for latest)", value="", placeholder=_current_year, key="wos_jcr_year")
+            _jcr_default = str(max(2024, time.gmtime().tm_year - 1))
+            jcr_year = st.text_input("JCR year (leave blank for latest)", value="", placeholder=_jcr_default, key="wos_jcr_year")
             edition_options = ["SCIE", "SSCI", "AHCI", "ESCI"]
             selected_editions = st.multiselect(
                 "Edition filter (optional, Web of Science index):",
@@ -1748,8 +1749,8 @@ elif app_mode == "Web of Science":
                     else:
                         progress_bar = st.progress(0)
                         status_text = st.empty()
-                        # Default to current year (most up-to-date) if blank, because jcrYear is required for metrics
-                        jcr_year_val = (jcr_year or "").strip() or str(time.gmtime().tm_year)
+                        # Default: previous year, floor 2024 (advances over time)
+                        jcr_year_val = (jcr_year or "").strip() or str(max(2024, time.gmtime().tm_year - 1))
                         edition_filter = ";".join(selected_editions) if selected_editions else None
                         journal_rows = fetch_wos_journal_data(
                             queries,
