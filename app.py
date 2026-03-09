@@ -841,8 +841,9 @@ def format_issn_for_wos(issn_clean):
     return f"{issn_clean[:4]}-{issn_clean[4:]}"
 
 
-def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_text):
-    """Fetch journal metadata and metrics (CiteScore, SNIP, SJR, etc.) by ISSN."""
+def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_text, citescore_year=None):
+    """Fetch journal metadata and metrics (CiteScore, SNIP, SJR, etc.) by ISSN.
+    citescore_year: optional year (e.g. 2023) to request that year's data; None = latest."""
     results = []
     total = len(issns)
     base_url = "https://api.elsevier.com/content/serial/title/issn"
@@ -850,6 +851,8 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
     for i, issn in enumerate(issns):
         status_text.text(f"Fetching ISSN {i+1} of {total}: {issn}...")
         url = f"{base_url}/{issn}?apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json"
+        if citescore_year:
+            url += f"&view=ENHANCED&date={citescore_year}"
 
         try:
             response = requests.get(url)
@@ -1460,6 +1463,15 @@ if app_mode == "Unified citation search":
                 placeholder="2161-797X\n1755-0645\n0309-0566",
                 key="unified_issn_input",
             )
+            _ucy = max(2020, time.gmtime().tm_year - 2)
+            unified_scopus_year = st.selectbox(
+                "Scopus CiteScore year (optional)",
+                ["Latest"] + [str(y) for y in range(_ucy, 2019, -1)],
+                help="Choose a specific year or Latest for current metric.",
+                key="unified_scopus_citescore_year",
+            )
+            unified_citescore_year_param = None if unified_scopus_year == "Latest" else unified_scopus_year
+
             _uj1, _uj2, _uj3 = st.columns([1, 1, 1])
             with _uj2:
                 unified_journal_clicked = st.button("🔍 Search WoS & Scopus", type="primary", use_container_width=True, key="unified_journal_btn")
@@ -1492,7 +1504,8 @@ if app_mode == "Unified citation search":
                         wos_journal_rows = []
                     if _scopus_ok:
                         scopus_journal_data = fetch_scopus_journal_data(
-                            clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text
+                            clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text,
+                            citescore_year=unified_citescore_year_param,
                         )
                     else:
                         scopus_journal_data = []
@@ -1873,6 +1886,15 @@ elif app_mode == "Scopus":
             st.caption("Enter one ISSN per line (with or without hyphen).")
             raw_issn_text = st.text_area("📋 Enter ISSNs (one per line)", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
+            _scy = max(2020, time.gmtime().tm_year - 2)
+            scopus_citescore_year = st.selectbox(
+                "CiteScore year (optional)",
+                ["Latest"] + [str(y) for y in range(_scy, 2019, -1)],
+                help="Choose a specific year or Latest for current metric.",
+                key="scopus_citescore_year",
+            )
+            citescore_year_param = None if scopus_citescore_year == "Latest" else scopus_citescore_year
+
             _j1, _j2, _j3 = st.columns([1, 1, 1])
             with _j2:
                 _journal_clicked = st.button("🔍 Search Scopus Journals", type="primary", use_container_width=True, key="scopus_journal_btn")
@@ -1885,7 +1907,10 @@ elif app_mode == "Scopus":
                 else:
                     progress_bar = st.progress(0)
                     status_text = st.empty()
-                    journal_data = fetch_scopus_journal_data(clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text)
+                    journal_data = fetch_scopus_journal_data(
+                        clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text,
+                        citescore_year=citescore_year_param,
+                    )
                     status_text.success(f"✅ Finished processing {len(journal_data)} records!")
                     df_journal = pd.DataFrame(journal_data)
                     st.session_state["scopus_journal_df"] = df_journal
