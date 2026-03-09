@@ -858,8 +858,9 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                         first = sjr_items[0] if isinstance(sjr_items[0], dict) else None
                         sjr = first.get("$", sjr_items[0]) if first else sjr_items[0]
 
-                    # CiteScore (current metric)
+                    # CiteScore (current metric) and year
                     cite_score = "N/A"
+                    cite_score_year = "N/A"
                     cs_list = entry.get("citeScoreYearInfoList", {}) or {}
                     if isinstance(cs_list, dict):
                         raw_cs = cs_list.get("citeScoreCurrentMetric")
@@ -867,11 +868,21 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                             cite_score = raw_cs.get("$", "N/A") or "N/A"
                         elif raw_cs is not None:
                             cite_score = raw_cs
+                        raw_year = cs_list.get("citeScoreCurrentMetricYear")
+                        if isinstance(raw_year, dict):
+                            cite_score_year = raw_year.get("$", "N/A") or "N/A"
+                        elif raw_year is not None:
+                            cite_score_year = str(raw_year)
                     elif isinstance(cs_list, list) and cs_list:
                         first = cs_list[0]
                         if isinstance(first, dict):
                             raw_cs = first.get("citeScoreCurrentMetric", first.get("$"))
                             cite_score = raw_cs.get("$", raw_cs) if isinstance(raw_cs, dict) else (raw_cs or "N/A")
+                            raw_year = first.get("citeScoreCurrentMetricYear")
+                            if isinstance(raw_year, dict):
+                                cite_score_year = raw_year.get("$", "N/A") or "N/A"
+                            elif raw_year is not None:
+                                cite_score_year = str(raw_year)
                         else:
                             cite_score = first
 
@@ -881,6 +892,7 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                         "Print ISSN": entry.get("prism:issn", "N/A"),
                         "eISSN": entry.get("prism:eIssn", "N/A"),
                         "CiteScore": cite_score,
+                        "CiteScore Year": cite_score_year,
                         "SNIP": snip,
                         "SJR": sjr,
                         "Subject Areas": subject_str or "N/A",
@@ -1390,11 +1402,92 @@ def _locked_view(reminder_message):
 # ==========================================
 if app_mode == "Unified citation search":
     _title_with_icon("Merge.png", "Unified Citation Search")
-    st.markdown("Search citation counts from **Web of Science**, **Scopus**, and **Google Scholar** in one go.")
-    st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
+    unified_search_type = st.radio(
+        "Search type:",
+        ["Citation by DOI", "Journal metrics by ISSNs"],
+        format_func=lambda x: "📄 Citation by DOI" if x == "Citation by DOI" else "📰 Journal metrics by ISSNs",
+        horizontal=True,
+        key="unified_search_type",
+    )
+
+    if unified_search_type == "Citation by DOI":
+        st.markdown("Search citation counts from **Web of Science**, **Scopus**, and **Google Scholar** in one go.")
+        st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
+    else:
+        st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go.")
+        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}.")
 
     if not api_unlocked:
         _locked_view(api_reminder)
+    elif unified_search_type == "Journal metrics by ISSNs":
+        if not WOS_JOURNAL_API_KEY and not _scopus_ok:
+            st.warning("Add at least one key for journal metrics: **WOS Journal API key** and/or **Scopus** (API key + institutional token) in Step 1.")
+        else:
+            raw_issn_input = st.text_area(
+                "📋 Paste ISSNs (one per line)",
+                height=200,
+                placeholder="2161-797X\n1755-0645\n0309-0566",
+                key="unified_issn_input",
+            )
+            _uj1, _uj2, _uj3 = st.columns([1, 1, 1])
+            with _uj2:
+                unified_journal_clicked = st.button("🔍 Search WoS & Scopus", type="primary", use_container_width=True, key="unified_journal_btn")
+
+            if unified_journal_clicked:
+                raw_lines = [line.strip() for line in raw_issn_input.split("\n") if line.strip()]
+                clean_issns = [clean_issn(issn) for issn in raw_lines if clean_issn(issn)]
+                if not clean_issns:
+                    st.warning("Please enter valid 8-character ISSNs (with or without hyphen).")
+                else:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    if WOS_JOURNAL_API_KEY:
+                        jcr_year_val = "2023"
+                        status_text.text("Fetching WoS (JCR) journal metrics...")
+                        wos_journal_rows = fetch_wos_journal_data(
+                            clean_issns,
+                            WOS_JOURNAL_API_KEY.strip(),
+                            jcr_year_val,
+                            None,
+                            progress_bar,
+                            status_text,
+                        )
+                        status_text.text("WoS done. Fetching Scopus journal metrics...")
+                    else:
+                        wos_journal_rows = []
+                    if _scopus_ok:
+                        scopus_journal_data = fetch_scopus_journal_data(
+                            clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text
+                        )
+                    else:
+                        scopus_journal_data = []
+                    status_text.success(f"✅ Finished: WoS {len(wos_journal_rows)} records, Scopus {len(scopus_journal_data)} records.")
+                    st.session_state["unified_wos_journal_df"] = pd.DataFrame(wos_journal_rows) if wos_journal_rows else None
+                    st.session_state["unified_scopus_journal_df"] = pd.DataFrame(scopus_journal_data) if scopus_journal_data else None
+
+            if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
+                st.divider()
+                st.subheader("WoS (JCR) journal metrics")
+                st.dataframe(st.session_state["unified_wos_journal_df"], width="stretch")
+                st.download_button(
+                    label="📥 Download WoS journal metrics (.xlsx)",
+                    data=to_excel(st.session_state["unified_wos_journal_df"]),
+                    file_name="unified_wos_journal_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="unified_wos_journal_download_btn",
+                )
+            if st.session_state.get("unified_scopus_journal_df") is not None and not st.session_state["unified_scopus_journal_df"].empty:
+                if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
+                    st.divider()
+                st.subheader("Scopus journal metrics")
+                st.dataframe(st.session_state["unified_scopus_journal_df"], width="stretch")
+                st.download_button(
+                    label="📥 Download Scopus journal metrics (.xlsx)",
+                    data=to_excel(st.session_state["unified_scopus_journal_df"]),
+                    file_name="unified_scopus_journal_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="unified_scopus_journal_download_btn",
+                )
     else:
         raw_input = st.text_area(
             "📋 Paste DOIs (one per line)",
