@@ -459,12 +459,6 @@ def _parse_wos_journal_entry(entry, query):
     issn = entry.get("issn") or "N/A"
     eissn = entry.get("eissn") or entry.get("eIssn") or "N/A"
     publisher = entry.get("publisher") or "N/A"
-    edition_list = entry.get("edition") or entry.get("editions") or []
-    if isinstance(edition_list, list):
-        edition_str = "; ".join(str(e) if not isinstance(e, dict) else e.get("name", e.get("id", "")) for e in edition_list)
-    else:
-        edition_str = str(edition_list)
-    edition_str = edition_str or "N/A"
     categories = entry.get("categories") or entry.get("category") or []
     if isinstance(categories, list):
         cat_str = "; ".join(
@@ -552,7 +546,6 @@ def _parse_wos_journal_entry(entry, query):
         "ISSN": issn,
         "eISSN": eissn,
         "Publisher": publisher,
-        "Edition(s)": edition_str,
         "Categories": cat_str,
         "JIF": jif,
         "JIF Percentile": jif_percentile or "N/A",
