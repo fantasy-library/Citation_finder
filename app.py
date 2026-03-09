@@ -144,7 +144,7 @@ with st.sidebar.expander("✏️ Enter keys manually"):
         manual_scopus = st.text_input("Scopus API key", type="password", placeholder="Scopus key", key="manual_scopus")
         manual_inst = st.text_input("Scopus institutional token", type="password", placeholder="Institutional token", key="manual_inst")
         manual_serp = st.text_input("SerpAPI key", type="password", placeholder="SerpAPI key", key="manual_serp")
-        submitted = st.form_submit_button("✓ Apply manual keys", type="primary")
+        submitted = st.form_submit_button("✓ Confirm", type="primary")
         if submitted:
             keys = st.session_state.get("api_keys", {})
             if manual_wos and manual_wos.strip():
