@@ -810,6 +810,13 @@ def clean_issn(issn_str):
     return cleaned if len(cleaned) == 8 else None
 
 
+def format_issn_for_wos(issn_clean):
+    """Format 8-char ISSN as XXXX-XXXX for WOS Journals API (expects hyphenated)."""
+    if not issn_clean or len(issn_clean) != 8:
+        return issn_clean
+    return f"{issn_clean[:4]}-{issn_clean[4:]}"
+
+
 def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_text):
     """Fetch journal metadata and metrics (CiteScore, SNIP, SJR, etc.) by ISSN."""
     results = []
@@ -1444,8 +1451,10 @@ if app_mode == "Unified citation search":
                     if WOS_JOURNAL_API_KEY:
                         jcr_year_val = "2023"
                         status_text.text("Fetching WoS (JCR) journal metrics...")
+                        # WOS Journals API expects ISSN in hyphenated form (e.g. 1476-4660)
+                        wos_queries = [format_issn_for_wos(issn) for issn in clean_issns]
                         wos_journal_rows = fetch_wos_journal_data(
-                            clean_issns,
+                            wos_queries,
                             WOS_JOURNAL_API_KEY.strip(),
                             jcr_year_val,
                             None,
