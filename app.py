@@ -1724,7 +1724,8 @@ elif app_mode == "Web of Science":
                 placeholder="0000-0000\n1363-2434\nJournal of Marketing",
                 key="wos_journal_queries",
             )
-            jcr_year = st.text_input("JCR year (e.g. 2019, 2023)", value="", key="wos_jcr_year")
+            _current_year = str(time.gmtime().tm_year)
+            jcr_year = st.text_input("JCR year (leave blank for latest)", value="", placeholder=_current_year, key="wos_jcr_year")
             edition_options = ["SCIE", "SSCI", "AHCI", "ESCI"]
             selected_editions = st.multiselect(
                 "Edition filter (optional, Web of Science index):",
@@ -1747,8 +1748,8 @@ elif app_mode == "Web of Science":
                     else:
                         progress_bar = st.progress(0)
                         status_text = st.empty()
-                        # Default to latest JCR year (e.g. 2023) if blank, because jcrYear is required for metrics
-                        jcr_year_val = (jcr_year or "").strip() or "2023"
+                        # Default to current year (most up-to-date) if blank, because jcrYear is required for metrics
+                        jcr_year_val = (jcr_year or "").strip() or str(time.gmtime().tm_year)
                         edition_filter = ";".join(selected_editions) if selected_editions else None
                         journal_rows = fetch_wos_journal_data(
                             queries,
