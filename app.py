@@ -1250,7 +1250,8 @@ st.markdown("""
     /* ----- Cards / sections ----- */
     .stTabs [data-baseweb="tab-list"] { gap: 0.5rem; margin-bottom: 1.25rem; }
     .stTabs [data-baseweb="tab"] { padding: 0.6rem 1.2rem; font-weight: 600; border-radius: 8px; font-size: 0.95rem !important; }
-    .stTabs [aria-selected="true"] { background: #0ea5e9 !important; color: white !important; }
+    .stTabs [aria-selected="true"],
+    .stTabs [aria-selected="true"] * { background: #0ea5e9 !important; color: white !important; border-color: transparent !important; }
 
     /* ----- Metrics ----- */
     [data-testid="stMetric"] { background: #f8fafc; padding: 1rem 1.25rem; border-radius: 10px; border: 1px solid #e2e8f0; }
