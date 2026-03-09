@@ -709,6 +709,30 @@ def fetch_wos_journal_data(queries, api_key, jcr_year, edition_filter, progress_
     return results
 
 
+def fetch_wos_journal_data_with_year_fallback(queries, api_key, jcr_year, edition_filter, progress_bar, status_text):
+    """Call fetch_wos_journal_data; if any result is 'No journal found', retry those with previous year and merge."""
+    results = fetch_wos_journal_data(queries, api_key, jcr_year, edition_filter, progress_bar, status_text)
+    try:
+        year_int = int(jcr_year)
+    except (TypeError, ValueError):
+        return results
+    if year_int <= 2024:
+        return results
+    failed_indices = [i for i, r in enumerate(results) if r.get("Status") == "No journal found"]
+    if not failed_indices:
+        return results
+    failed_queries = [queries[i] for i in failed_indices]
+    prev_year = str(year_int - 1)
+    status_text.text(f"Retrying {len(failed_queries)} not found with JCR year {prev_year}...")
+    retry_results = fetch_wos_journal_data(
+        failed_queries, api_key, prev_year, edition_filter, progress_bar, status_text
+    )
+    for j, idx in enumerate(failed_indices):
+        if j < len(retry_results) and retry_results[j].get("Status") != "No journal found":
+            results[idx] = retry_results[j]
+    return results
+
+
 # ==========================================
 # HELPER FUNCTIONS (SCOPUS – Elsevier Citation Metrics by DOI)
 # ==========================================
@@ -1449,13 +1473,13 @@ if app_mode == "Unified citation search":
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     if WOS_JOURNAL_API_KEY:
-                        # Default: previous year, but not before 2024 (JCR lags; advances as time goes by)
+                        # Default: 2 years back so JCR data is usually released (no manual update needed)
                         _y = time.gmtime().tm_year
-                        jcr_year_val = str(max(2024, _y - 1))
+                        jcr_year_val = str(max(2024, _y - 2))
                         status_text.text("Fetching WoS (JCR) journal metrics...")
                         # WOS Journals API expects ISSN in hyphenated form (e.g. 1476-4660)
                         wos_queries = [format_issn_for_wos(issn) for issn in clean_issns]
-                        wos_journal_rows = fetch_wos_journal_data(
+                        wos_journal_rows = fetch_wos_journal_data_with_year_fallback(
                             wos_queries,
                             WOS_JOURNAL_API_KEY.strip(),
                             jcr_year_val,
@@ -1725,7 +1749,7 @@ elif app_mode == "Web of Science":
                 placeholder="0000-0000\n1363-2434\nJournal of Marketing",
                 key="wos_journal_queries",
             )
-            _jcr_default = str(max(2024, time.gmtime().tm_year - 1))
+            _jcr_default = str(max(2024, time.gmtime().tm_year - 2))
             jcr_year = st.text_input("JCR year (leave blank for latest)", value="", placeholder=_jcr_default, key="wos_jcr_year")
             edition_options = ["SCIE", "SSCI", "AHCI", "ESCI"]
             selected_editions = st.multiselect(
@@ -1749,10 +1773,10 @@ elif app_mode == "Web of Science":
                     else:
                         progress_bar = st.progress(0)
                         status_text = st.empty()
-                        # Default: previous year, floor 2024 (advances over time)
-                        jcr_year_val = (jcr_year or "").strip() or str(max(2024, time.gmtime().tm_year - 1))
+                        # Default when blank: 2 years back so data is usually available (automatic, no manual update)
+                        jcr_year_val = (jcr_year or "").strip() or str(max(2024, time.gmtime().tm_year - 2))
                         edition_filter = ";".join(selected_editions) if selected_editions else None
-                        journal_rows = fetch_wos_journal_data(
+                        journal_rows = fetch_wos_journal_data_with_year_fallback(
                             queries,
                             WOS_JOURNAL_API_KEY.strip(),
                             jcr_year_val,
