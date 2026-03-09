@@ -1449,7 +1449,8 @@ if app_mode == "Unified citation search":
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     if WOS_JOURNAL_API_KEY:
-                        jcr_year_val = "2023"
+                        # Use current year by default (most up-to-date JCR report)
+                        jcr_year_val = str(time.gmtime().tm_year)
                         status_text.text("Fetching WoS (JCR) journal metrics...")
                         # WOS Journals API expects ISSN in hyphenated form (e.g. 1476-4660)
                         wos_queries = [format_issn_for_wos(issn) for issn in clean_issns]
