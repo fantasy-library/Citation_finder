@@ -98,6 +98,18 @@ if "api_keys_errors" not in st.session_state:
 # ==========================================
 _icons_dir = Path(__file__).resolve().parent / "icons"
 st.sidebar.markdown("### 🔑 Step 1: API keys")
+
+# 1) Drag and drop file first
+uploaded_keys_file = st.sidebar.file_uploader(
+    "Drag and drop file here",
+    type=["txt", "env"],
+    key="api_keys_upload",
+    label_visibility="collapsed",
+)
+if uploaded_keys_file is None:
+    st.sidebar.caption("No file chosen")
+
+# 2) Download template below
 template_content = get_api_keys_template_content()
 st.sidebar.download_button(
     label="📥 Download template (.txt)",
@@ -106,11 +118,7 @@ st.sidebar.download_button(
     mime="text/plain",
     key="download_api_template",
 )
-uploaded_keys_file = st.sidebar.file_uploader(
-    "Upload API keys file",
-    type=["txt", "env"],
-    key="api_keys_upload",
-)
+
 if uploaded_keys_file is not None:
     try:
         raw = uploaded_keys_file.read().decode("utf-8")
@@ -1281,6 +1289,44 @@ st.markdown("""
     [data-testid="stFileUploader"] p,
     [data-testid="stFileUploader"] [class*="help"],
     [data-testid="stFileUploader"] [class*="limit"] { display: none !important; }
+
+    /* ----- Step 1 API keys: card-style layout and drop zone ----- */
+    [data-testid="stSidebar"] [data-testid="stFileUploader"] {
+        margin-bottom: 0.75rem;
+    }
+    [data-testid="stSidebar"] [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"],
+    [data-testid="stSidebar"] [data-testid="stFileUploader"] section {
+        border: 2px dashed #cbd5e1 !important;
+        border-radius: 10px !important;
+        background: #f8fafc !important;
+        padding: 1rem 0.75rem !important;
+        min-height: 4rem !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"]:hover,
+    [data-testid="stSidebar"] [data-testid="stFileUploader"] section:hover {
+        border-color: #0ea5e9 !important;
+        background: #f0f9ff !important;
+    }
+    [data-testid="stSidebar"] .stDownloadButton {
+        margin-top: 0.5rem;
+        margin-bottom: 0.5rem;
+    }
+    [data-testid="stSidebar"] .stDownloadButton > button {
+        width: 100%;
+        border: 1px solid #e2e8f0;
+        background: #fff;
+        color: #1e293b;
+    }
+    [data-testid="stSidebar"] .stDownloadButton > button:hover {
+        border-color: #0ea5e9;
+        background: #f0f9ff;
+        color: #0284c7;
+    }
+    [data-testid="stSidebar"] .stExpander {
+        margin-top: 0.25rem;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
