@@ -4,8 +4,13 @@ import pandas as pd
 import time
 import io
 import re
+import json
+import hashlib
 from pathlib import Path
 from urllib.parse import quote, unquote
+
+# ISSNs per batch; partial CSV + checkpoint saved after each batch
+JOURNAL_BATCH_SIZE = 200
 
 try:
     import streamlit.components.v1 as components
@@ -1246,6 +1251,191 @@ def search_crossref_works(
 
 
 # ==========================================
+# JOURNAL METRICS – Batched fetch + checkpoint (partial auto-save)
+# ==========================================
+def _checkpoint_root():
+    root = Path(__file__).resolve().parent / ".job_checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _journal_job_fingerprint(items, tag=""):
+    """Stable id for the same ISSN/query list + options (for resume)."""
+    key = tag + "|" + "|".join(str(x) for x in items)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+
+
+def _partial_csv_path(job_id, platform):
+    return _checkpoint_root() / f"{job_id}_{platform}_partial.csv"
+
+
+def _checkpoint_meta_path(job_id):
+    return _checkpoint_root() / f"{job_id}_meta.json"
+
+
+def _load_checkpoint_meta(job_id):
+    path = _checkpoint_meta_path(job_id)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_checkpoint_meta(job_id, meta):
+    path = _checkpoint_meta_path(job_id)
+    path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _find_resumable_job_id(fingerprint, platform):
+    """Latest job with same fingerprint and incomplete platform progress."""
+    root = _checkpoint_root()
+    best = None
+    best_ts = 0
+    for meta_path in root.glob("*_meta.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if meta.get("fingerprint") != fingerprint:
+            continue
+        done = meta.get(f"{platform}_done", 0)
+        total = meta.get(f"{platform}_total", 0)
+        if total and done < total:
+            ts = meta.get("updated", 0)
+            if ts >= best_ts:
+                best_ts = ts
+                best = meta.get("job_id")
+    return best
+
+
+def _find_resumable_job_id_any(fingerprint):
+    """Job id if any platform for this fingerprint is incomplete."""
+    for platform in ("wos", "scopus"):
+        job_id = _find_resumable_job_id(fingerprint, platform)
+        if job_id:
+            return job_id
+    return None
+
+
+def _load_partial_rows(job_id, platform):
+    path = _partial_csv_path(job_id, platform)
+    if not path.exists():
+        return []
+    try:
+        return pd.read_csv(path).to_dict("records")
+    except Exception:
+        return []
+
+
+def _save_partial_rows(job_id, platform, rows):
+    path = _partial_csv_path(job_id, platform)
+    pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8")
+
+
+def run_batched_journal_fetch(
+    items,
+    fetch_chunk_fn,
+    job_id,
+    platform,
+    fingerprint,
+    progress_bar,
+    status_text,
+    resume=True,
+    batch_size=JOURNAL_BATCH_SIZE,
+):
+    """
+    Fetch items in batches; after each batch write partial CSV and checkpoint meta.
+    Returns all rows (including resumed partial data).
+    """
+    if not items:
+        return []
+
+    meta = _load_checkpoint_meta(job_id)
+    all_rows = []
+    start_idx = 0
+
+    if resume and meta.get("fingerprint") == fingerprint:
+        done = int(meta.get(f"{platform}_done", 0))
+        if done > 0:
+            all_rows = _load_partial_rows(job_id, platform)
+            start_idx = min(done, len(items))
+            if start_idx > 0:
+                status_text.text(
+                    f"Resuming {platform.upper()}: {start_idx} of {len(items)} already saved; continuing..."
+                )
+
+    total = len(items)
+    if start_idx >= total:
+        progress_bar.progress(1.0)
+        return all_rows
+
+    for batch_start in range(start_idx, total, batch_size):
+        batch_end = min(batch_start + batch_size, total)
+        chunk = items[batch_start:batch_end]
+        status_text.text(
+            f"{platform.upper()}: batch {batch_start + 1}–{batch_end} of {total} "
+            f"(auto-saving every {batch_size})..."
+        )
+        batch_rows = fetch_chunk_fn(chunk, progress_bar, status_text)
+        all_rows.extend(batch_rows)
+        _save_partial_rows(job_id, platform, all_rows)
+        prev = _load_checkpoint_meta(job_id)
+        meta = {
+            **prev,
+            "job_id": job_id,
+            "fingerprint": fingerprint,
+            f"{platform}_done": batch_end,
+            f"{platform}_total": total,
+            "updated": time.time(),
+        }
+        _save_checkpoint_meta(job_id, meta)
+        progress_bar.progress(batch_end / total)
+
+    return all_rows
+
+
+def _prepare_journal_job(fingerprint, platform, resume, unified=False):
+    """Resolve job_id for a new or resumed run."""
+    if resume:
+        if unified:
+            existing = _find_resumable_job_id_any(fingerprint)
+        else:
+            existing = _find_resumable_job_id(fingerprint, platform)
+        if existing:
+            return existing
+    return f"{fingerprint}_{int(time.time())}"
+
+
+def _render_partial_checkpoint_download(job_id, platform, label, key_suffix):
+    """Show auto-save status and download button for partial CSV if present."""
+    path = _partial_csv_path(job_id, platform)
+    meta = _load_checkpoint_meta(job_id)
+    if not path.exists():
+        return
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return
+    if df.empty:
+        return
+    done = meta.get(f"{platform}_done", len(df))
+    total = meta.get(f"{platform}_total", len(df))
+    st.caption(
+        f"💾 **{label}:** {len(df)} rows auto-saved "
+        f"({done}/{total} processed). File: `{path.name}`"
+    )
+    st.download_button(
+        label=f"📥 Download partial {label} (.xlsx)",
+        data=to_excel(df),
+        file_name=f"{platform}_partial_{job_id[:12]}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"partial_dl_{platform}_{key_suffix}",
+    )
+
+
+# ==========================================
 # EXCEL GENERATOR (In-Memory)
 # ==========================================
 def to_excel(df):
@@ -1464,6 +1654,16 @@ if app_mode == "Unified citation search":
             )
             unified_citescore_year_param = (unified_scopus_year or "").strip() or None
 
+            st.caption(
+                f"Large lists are processed in batches of **{JOURNAL_BATCH_SIZE}** ISSNs. "
+                "Partial results are auto-saved after each batch so progress is not lost if the run stops."
+            )
+            unified_resume = st.checkbox(
+                "Resume previous run (same ISSN list)",
+                value=True,
+                key="unified_journal_resume",
+            )
+
             _uj1, _uj2, _uj3 = st.columns([1, 1, 1])
             with _uj2:
                 unified_journal_clicked = st.button("🔍 Search WoS & Scopus", type="primary", use_container_width=True, key="unified_journal_btn")
@@ -1474,36 +1674,74 @@ if app_mode == "Unified citation search":
                 if not clean_issns:
                     st.warning("Please enter valid 8-character ISSNs (with or without hyphen).")
                 else:
+                    _y = time.gmtime().tm_year
+                    jcr_year_val = str(max(2024, _y - 2))
+                    fp = _journal_job_fingerprint(
+                        clean_issns,
+                        f"unified|{jcr_year_val}|{unified_citescore_year_param or ''}",
+                    )
+                    job_id = _prepare_journal_job(fp, "wos", unified_resume, unified=True)
+                    st.session_state["unified_journal_job_id"] = job_id
+
                     progress_bar = st.progress(0)
                     status_text = st.empty()
+                    wos_journal_rows = []
                     if WOS_JOURNAL_API_KEY:
-                        # Default: 2 years back so JCR data is usually released (no manual update needed)
-                        _y = time.gmtime().tm_year
-                        jcr_year_val = str(max(2024, _y - 2))
-                        status_text.text("Fetching WoS (JCR) journal metrics...")
-                        # WOS Journals API expects ISSN in hyphenated form (e.g. 1476-4660)
                         wos_queries = [format_issn_for_wos(issn) for issn in clean_issns]
-                        wos_journal_rows = fetch_wos_journal_data_with_year_fallback(
+
+                        def _wos_chunk(chunk, pb, stxt):
+                            return fetch_wos_journal_data_with_year_fallback(
+                                chunk,
+                                WOS_JOURNAL_API_KEY.strip(),
+                                jcr_year_val,
+                                None,
+                                pb,
+                                stxt,
+                            )
+
+                        wos_journal_rows = run_batched_journal_fetch(
                             wos_queries,
-                            WOS_JOURNAL_API_KEY.strip(),
-                            jcr_year_val,
-                            None,
+                            _wos_chunk,
+                            job_id,
+                            "wos",
+                            fp,
                             progress_bar,
                             status_text,
+                            resume=unified_resume,
                         )
                         status_text.text("WoS done. Fetching Scopus journal metrics...")
-                    else:
-                        wos_journal_rows = []
                     if _scopus_ok:
-                        scopus_journal_data = fetch_scopus_journal_data(
-                            clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text,
-                            citescore_year=unified_citescore_year_param,
+
+                        def _scopus_chunk(chunk, pb, stxt):
+                            return fetch_scopus_journal_data(
+                                chunk,
+                                SCOPUS_API_KEY,
+                                SCOPUS_INST_TOKEN,
+                                pb,
+                                stxt,
+                                citescore_year=unified_citescore_year_param,
+                            )
+
+                        scopus_journal_data = run_batched_journal_fetch(
+                            clean_issns,
+                            _scopus_chunk,
+                            job_id,
+                            "scopus",
+                            fp,
+                            progress_bar,
+                            status_text,
+                            resume=unified_resume,
                         )
                     else:
                         scopus_journal_data = []
                     status_text.success(f"✅ Finished: WoS {len(wos_journal_rows)} records, Scopus {len(scopus_journal_data)} records.")
                     st.session_state["unified_wos_journal_df"] = pd.DataFrame(wos_journal_rows) if wos_journal_rows else None
                     st.session_state["unified_scopus_journal_df"] = pd.DataFrame(scopus_journal_data) if scopus_journal_data else None
+
+            _uj_job = st.session_state.get("unified_journal_job_id")
+            if _uj_job:
+                _render_partial_checkpoint_download(_uj_job, "wos", "WoS (JCR)", "unified")
+                _render_partial_checkpoint_download(_uj_job, "scopus", "Scopus", "unified")
 
             if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
                 st.divider()
@@ -1764,6 +2002,16 @@ elif app_mode == "Web of Science":
                 help="Matches the Journals API `edition` parameter. Leave empty to include all editions.",
             )
 
+            st.caption(
+                f"Large lists are processed in batches of **{JOURNAL_BATCH_SIZE}**. "
+                "Partial results auto-save after each batch."
+            )
+            wos_resume = st.checkbox(
+                "Resume previous run (same ISSN/title list)",
+                value=True,
+                key="wos_journal_resume",
+            )
+
             _j1, _j2, _j3 = st.columns([1, 1, 1])
             with _j2:
                 _wos_journal_clicked = st.button("🔍 Search WOS Journals (JCR)", type="primary", use_container_width=True, key="wos_journal_btn")
@@ -1776,22 +2024,42 @@ elif app_mode == "Web of Science":
                     if not queries:
                         st.warning("Please enter at least one ISSN or journal title.")
                     else:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        # Default when blank: 2 years back so data is usually available (automatic, no manual update)
                         jcr_year_val = (jcr_year or "").strip() or str(max(2024, time.gmtime().tm_year - 2))
                         edition_filter = ";".join(selected_editions) if selected_editions else None
-                        journal_rows = fetch_wos_journal_data_with_year_fallback(
+                        fp = _journal_job_fingerprint(queries, f"wos|{jcr_year_val}|{edition_filter or ''}")
+                        job_id = _prepare_journal_job(fp, "wos", wos_resume)
+                        st.session_state["wos_journal_job_id"] = job_id
+
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+
+                        def _wos_j_chunk(chunk, pb, stxt):
+                            return fetch_wos_journal_data_with_year_fallback(
+                                chunk,
+                                WOS_JOURNAL_API_KEY.strip(),
+                                jcr_year_val,
+                                edition_filter,
+                                pb,
+                                stxt,
+                            )
+
+                        journal_rows = run_batched_journal_fetch(
                             queries,
-                            WOS_JOURNAL_API_KEY.strip(),
-                            jcr_year_val,
-                            edition_filter,
+                            _wos_j_chunk,
+                            job_id,
+                            "wos",
+                            fp,
                             progress_bar,
                             status_text,
+                            resume=wos_resume,
                         )
                         status_text.success(f"✅ Finished processing {len(journal_rows)} records!")
-                        df_wos_journal = pd.DataFrame(journal_rows)
-                        st.session_state["wos_journal_df"] = df_wos_journal
+                        st.session_state["wos_journal_df"] = pd.DataFrame(journal_rows)
+
+            if st.session_state.get("wos_journal_job_id"):
+                _render_partial_checkpoint_download(
+                    st.session_state["wos_journal_job_id"], "wos", "WoS (JCR)", "wos_only"
+                )
 
             if "wos_journal_df" in st.session_state and wos_search_mode == "Journal metrics (JCR by ISSN/title)":
                 st.divider()
@@ -1886,6 +2154,16 @@ elif app_mode == "Scopus":
             )
             citescore_year_param = (scopus_citescore_year or "").strip() or None
 
+            st.caption(
+                f"Large lists are processed in batches of **{JOURNAL_BATCH_SIZE}**. "
+                "Partial results auto-save after each batch."
+            )
+            scopus_resume = st.checkbox(
+                "Resume previous run (same ISSN list)",
+                value=True,
+                key="scopus_journal_resume",
+            )
+
             _j1, _j2, _j3 = st.columns([1, 1, 1])
             with _j2:
                 _journal_clicked = st.button("🔍 Search Scopus Journals", type="primary", use_container_width=True, key="scopus_journal_btn")
@@ -1896,15 +2174,40 @@ elif app_mode == "Scopus":
                 if not clean_issns:
                     st.warning("Please enter valid 8-character ISSNs (with or without hyphen).")
                 else:
+                    fp = _journal_job_fingerprint(clean_issns, f"scopus|{citescore_year_param or ''}")
+                    job_id = _prepare_journal_job(fp, "scopus", scopus_resume)
+                    st.session_state["scopus_journal_job_id"] = job_id
+
                     progress_bar = st.progress(0)
                     status_text = st.empty()
-                    journal_data = fetch_scopus_journal_data(
-                        clean_issns, SCOPUS_API_KEY, SCOPUS_INST_TOKEN, progress_bar, status_text,
-                        citescore_year=citescore_year_param,
+
+                    def _scopus_j_chunk(chunk, pb, stxt):
+                        return fetch_scopus_journal_data(
+                            chunk,
+                            SCOPUS_API_KEY,
+                            SCOPUS_INST_TOKEN,
+                            pb,
+                            stxt,
+                            citescore_year=citescore_year_param,
+                        )
+
+                    journal_data = run_batched_journal_fetch(
+                        clean_issns,
+                        _scopus_j_chunk,
+                        job_id,
+                        "scopus",
+                        fp,
+                        progress_bar,
+                        status_text,
+                        resume=scopus_resume,
                     )
                     status_text.success(f"✅ Finished processing {len(journal_data)} records!")
-                    df_journal = pd.DataFrame(journal_data)
-                    st.session_state["scopus_journal_df"] = df_journal
+                    st.session_state["scopus_journal_df"] = pd.DataFrame(journal_data)
+
+            if st.session_state.get("scopus_journal_job_id"):
+                _render_partial_checkpoint_download(
+                    st.session_state["scopus_journal_job_id"], "scopus", "Scopus", "scopus_only"
+                )
 
             if "scopus_journal_df" in st.session_state:
                 st.divider()

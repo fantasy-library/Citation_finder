@@ -3,6 +3,9 @@
 # Filled API keys file (template is safe to commit)
 api_keys.txt
 
+# Auto-saved journal metrics checkpoints (partial results)
+.job_checkpoints/
+
 # Python
 __pycache__/
 *.py[cod]
