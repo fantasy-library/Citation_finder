@@ -1360,13 +1360,18 @@ def _save_partial_rows(job_id, platform, rows):
 _PUBLIC_UA = "AcademicDatabaseSearch/1.0 (journal brief description; local research tool)"
 _HTML_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 _DESC_MAX_WORDS = 299
+_DESC_VERSION = "4"
 _public_http = None
 _GARBAGE_SENTENCE = re.compile(
-    r"^(indexed in|indexing|impact factor|journal impact factor|editor-in-chief|publishing model|submission to|downloads\b)\b",
+    r"^(indexed in|indexing|impact factor|journal impact factor|editors?-in-?\s*chiefs?|publishing model|submission to|downloads\b|prof\.)\b|\bview all editors\b",
     re.I,
 )
 _GARBAGE_PAGE = re.compile(
-    r"\b(cookie policy|enable javascript|access denied|just a moment|sign in to|subscribe to continue|captcha|are you a robot|403 forbidden|page not found|cookies_not_supported)\b",
+    r"\b(cookie policy|essential cookies|privacy preference|your privacy|enable javascript|access denied|just a moment|sign in to|subscribe to continue|captcha|are you a robot|403 forbidden|page not found|cookies_not_supported)\b",
+    re.I,
+)
+_SPRINGER_JOURNAL = re.compile(
+    r"https?://(?:www\.)?(?:link\.)?springer\.com/journal/(\d+)(?:/|$)",
     re.I,
 )
 
@@ -1482,7 +1487,11 @@ def _html_has_description(page):
 
 
 def _public_get_html(url, timeout=25):
-    headers = {"User-Agent": _HTML_UA, "Accept": "text/html,application/xhtml+xml"}
+    headers = {
+        "User-Agent": _HTML_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     bodies = []
     try:
         resp = _os_trust_session().get(url, headers=headers, timeout=timeout, allow_redirects=True)
@@ -1570,6 +1579,47 @@ def _meta_descriptions(page_html):
     return found
 
 
+def _jsonld_description_strings(block):
+    found = []
+    try:
+        _collect_jsonld_descriptions(json.loads(block), found)
+        return found
+    except json.JSONDecodeError:
+        pass
+    for raw in re.findall(r'"description"\s*:\s*"((?:\\.|[^"\\])*)"', block):
+        try:
+            value = json.loads(f'"{raw}"')
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, str):
+            found.append(value)
+    return found
+
+
+def _overview_markup(page_html):
+    """Visible journal blurb. Springer puts the full overview here and a shortened copy in the meta tag."""
+    for pattern in (
+        r'data-test="darwin-journal-homepage-promo-text"[^>]*>(.*?)</div>',
+        r'app-journal-overview__promo-text[^>]*>(.*?)</div>',
+    ):
+        match = re.search(pattern, page_html, flags=re.I | re.S)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _best_description(candidates):
+    cleaned = []
+    for raw in candidates:
+        text = _limit_description(raw)
+        if text and not text.rstrip().endswith("..."):
+            cleaned.append(text)
+    if not cleaned:
+        return ""
+    cleaned.sort(key=len, reverse=True)
+    return cleaned[0]
+
+
 def _harvest_page_description(url):
     if not url or not str(url).startswith("http"):
         return ""
@@ -1582,19 +1632,129 @@ def _harvest_page_description(url):
         page_html,
         flags=re.I | re.S,
     ):
-        try:
-            _collect_jsonld_descriptions(json.loads(block), jsonld)
-        except json.JSONDecodeError:
-            continue
-    cleaned = []
-    for raw in jsonld + _meta_descriptions(page_html):
-        text = _limit_description(raw)
-        if text:
-            cleaned.append(text)
-    if not cleaned:
+        jsonld.extend(_jsonld_description_strings(block))
+    return _best_description(jsonld + [_overview_markup(page_html)] + _meta_descriptions(page_html))
+
+
+def _extra_page_urls(url):
+    match = _SPRINGER_JOURNAL.search(str(url or ""))
+    if not match:
+        return []
+    journal_id = match.group(1)
+    base = f"https://link.springer.com/journal/{journal_id}"
+    return [base, base + "/aims-and-scope"]
+
+
+def _markdown_to_prose(md):
+    text = md or ""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[*_`>#]", " ", text)
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*[-*]\s+", "", line).strip()
+        if line:
+            lines.append(line)
+    return " ".join(lines)
+
+
+def _description_from_markdown(md):
+    text = (md or "").replace("\r\n", "\n")
+    if "Markdown Content:" in text:
+        text = text.split("Markdown Content:", 1)[1]
+    overview = re.search(r"^## Overview\s*(.*?)(?=^## |\Z)", text, flags=re.I | re.S | re.M)
+    if overview:
+        chunk = overview.group(1)
+    else:
+        chunk = ""
+        for part in re.split(r"^## ", text, flags=re.M):
+            if re.search(r"privacy|cookie|editorial board|latest articles|journal menu", part[:120], re.I):
+                continue
+            if len(part.split()) >= 20:
+                chunk = part
+                break
+        if not chunk:
+            chunk = text[:4000]
+    chunk = re.split(
+        r"\n+\s*(?:#{1,3}\s*)?(?:Editors?-in-?\s*Chiefs?|Editorial board|Societies and partnerships|Journal metrics|Journal updates)\b",
+        chunk,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    return _limit_description(_markdown_to_prose(chunk))
+
+
+def _jina_description(url, timeout=28):
+    """Read a public journal page through a fetch proxy when the publisher blocks this server."""
+    if not url or not str(url).startswith("http"):
         return ""
-    cleaned.sort(key=lambda item: (not item.rstrip().endswith("..."), len(item.split())), reverse=True)
-    return cleaned[0]
+    reader = "https://r.jina.ai/" + str(url).strip()
+    headers = {"User-Agent": _PUBLIC_UA, "Accept": "text/plain", "X-Return-Format": "markdown"}
+    try:
+        resp = _os_trust_session().get(reader, headers=headers, timeout=timeout)
+    except requests.RequestException:
+        return ""
+    if resp.status_code != 200 or not resp.text:
+        return ""
+    return _description_from_markdown(resp.text)
+
+
+def _catalog_page_urls(issn):
+    """Publisher links from the NLM catalog. Used when OpenAlex has no homepage."""
+    cleaned = clean_issn(issn)
+    if not cleaned:
+        return []
+    hyphen = format_issn_for_wos(cleaned)
+    data, _status = _public_get_json(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params={
+            "db": "nlmcatalog",
+            "term": f"{hyphen}[ISSN]",
+            "retmode": "json",
+            "retmax": "1",
+            "tool": "academic_database_search",
+        },
+    )
+    ids = ((data or {}).get("esearchresult") or {}).get("idlist") if isinstance(data, dict) else None
+    if not ids:
+        return []
+    xml_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urlencode(
+        {
+            "db": "nlmcatalog",
+            "id": str(ids[0]),
+            "retmode": "xml",
+            "tool": "academic_database_search",
+        }
+    )
+    page = _public_get_html(xml_url, timeout=25)
+    if not page:
+        return []
+    urls = []
+    for raw in re.findall(r"https?://[^\s<>\"']+", page):
+        raw = raw.rstrip(").,;")
+        host = raw.split("/")[2].lower() if "://" in raw else ""
+        if any(skip in host for skip in ("ncbi.nlm.nih.gov", "nlm.nih.gov", "nih.gov", "pubmed", "doi.org", "europepmc.org")):
+            continue
+        if raw not in urls:
+            urls.append(raw)
+    return urls[:4]
+
+
+def _first_page_description(urls):
+    expanded = []
+    for url in _unique_urls(urls):
+        expanded.append(url)
+        expanded.extend(_extra_page_urls(url))
+    expanded = _unique_urls(expanded)
+    for url in expanded:
+        harvested = _harvest_page_description(url)
+        if harvested:
+            return harvested
+    for url in expanded:
+        harvested = _jina_description(url)
+        if harvested:
+            return harvested
+    return ""
 
 
 def _doaj_aims_url(hyphen):
@@ -1718,29 +1878,30 @@ def _description_from_source(data, issn_for_doaj=""):
     if text:
         return text
 
-    tried = []
-    for page_url in _unique_urls([homepage, official_site]):
-        tried.append(page_url.strip().rstrip("/").lower())
-        harvested = _harvest_page_description(page_url)
-        if harvested:
-            return harvested
+    page_urls = _unique_urls([homepage, official_site])
+    harvested = _first_page_description(page_urls)
+    if harvested:
+        return harvested
 
     hyphen = format_issn_for_wos(clean_issn(issn_for_doaj) or "")
     if not hyphen and data.get("issn_l"):
         hyphen = format_issn_for_wos(clean_issn(str(data.get("issn_l"))) or "")
+    if not page_urls and hyphen:
+        harvested = _first_page_description(_catalog_page_urls(hyphen))
+        if harvested:
+            return harvested
     if hyphen and len(clean_issn(hyphen) or "") == 8:
         aims_url = _doaj_aims_url(hyphen)
-        if aims_url and aims_url.strip().rstrip("/").lower() not in tried:
-            harvested = _harvest_page_description(aims_url)
-            if harvested:
-                return harvested
+        harvested = _first_page_description([aims_url])
+        if harvested:
+            return harvested
     return ""
 
 
 def fetch_journal_brief_description(issn=None, title=None):
     """Short journal overview. ISSN first, then an exact journal-title match."""
     source = _openalex_source_by_issn(issn) if issn else None
-    text = _description_from_source(source, issn or "") if source else ""
+    text = _description_from_source(source or {}, issn or "") if (source or issn) else ""
     if text:
         return text
     if title and not clean_issn(str(title)):
@@ -1860,7 +2021,7 @@ def _ensure_brief_descriptions(df, state_key):
         f"{_cell_text(row.get('Journal Title'))}|{_cell_text(row.get('Queried ISSN'))}|{_cell_text(row.get('Query'))}|{_cell_text(row.get('Brief description'))}"
         for row in rows
     )
-    marker = state_key + "|" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()
+    marker = state_key + "|v" + _DESC_VERSION + "|" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()
     done = st.session_state.setdefault("_desc_refresh_markers", set())
     if marker in done:
         return df
