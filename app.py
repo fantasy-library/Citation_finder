@@ -6,8 +6,11 @@ import io
 import re
 import json
 import hashlib
+import shutil
+import ssl
+import subprocess
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlencode
 
 # ISSNs per batch; partial CSV + checkpoint saved after each batch
 JOURNAL_BATCH_SIZE = 200
@@ -1334,6 +1337,208 @@ def _save_partial_rows(job_id, platform, rows):
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8")
 
 
+# ==========================================
+# Journal brief description (OpenAlex ISSN -> Wikidata -> Wikipedia)
+# No extra API key. Filled on the same ISSN searches that use WOS/Scopus keys.
+# ==========================================
+_PUBLIC_UA = "AcademicDatabaseSearch/1.0 (journal brief description; local research tool)"
+_public_http = None
+
+
+class _OSTrustAdapter(requests.adapters.HTTPAdapter):
+    """Use the OS certificate store. certifi alone fails for some hosts on this machine."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = ssl.create_default_context()
+        return super().init_poolmanager(*args, **kwargs)
+
+
+def _os_trust_session():
+    global _public_http
+    if _public_http is None:
+        session = requests.Session()
+        session.mount("https://", _OSTrustAdapter())
+        _public_http = session
+    return _public_http
+
+
+def _curl_executable():
+    return shutil.which("curl.exe") or shutil.which("curl")
+
+
+def _curl_get_json(url, timeout=30):
+    """GET JSON via curl. Wikimedia blocks Python's TLS client here, and curl uses the OS trust store."""
+    exe = _curl_executable()
+    if not exe:
+        return None, None
+    try:
+        proc = subprocess.run(
+            [
+                exe, "-fsS", "--max-time", str(int(timeout)),
+                "-A", _PUBLIC_UA,
+                "-H", "Accept: application/json",
+                url,
+            ],
+            capture_output=True,
+            timeout=timeout + 10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", errors="replace")
+        for code in (404, 403, 429):
+            if str(code) in err:
+                return None, code
+        return None, None
+    try:
+        return json.loads(proc.stdout.decode("utf-8")), 200
+    except json.JSONDecodeError:
+        return None, None
+
+
+def _public_get_json(url, params=None, timeout=30):
+    if params:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{urlencode(params)}"
+    host = url.split("/")[2] if "://" in url else ""
+    wikimedia = host.endswith(("wikipedia.org", "wikidata.org", "wikimedia.org"))
+    if wikimedia and _curl_executable():
+        return _curl_get_json(url, timeout)
+    headers = {"User-Agent": _PUBLIC_UA, "Accept": "application/json"}
+    try:
+        resp = _os_trust_session().get(url, headers=headers, timeout=timeout)
+    except requests.RequestException:
+        if _curl_executable():
+            return _curl_get_json(url, timeout)
+        return None, None
+    if resp.status_code in (403, 429) and _curl_executable():
+        return _curl_get_json(url, timeout)
+    if resp.status_code != 200:
+        return None, resp.status_code
+    try:
+        return resp.json(), 200
+    except ValueError:
+        return None, resp.status_code
+
+
+def fetch_journal_brief_description(issn):
+    """English Wikipedia lead paragraph for an ISSN, or 'N/A' when none exists."""
+    cleaned = clean_issn(issn)
+    if not cleaned:
+        return "N/A"
+    hyphen = format_issn_for_wos(cleaned)
+    data, status = _public_get_json(f"https://api.openalex.org/sources/issn:{hyphen}")
+    if status == 429:
+        time.sleep(2)
+        data, status = _public_get_json(f"https://api.openalex.org/sources/issn:{hyphen}")
+    if not isinstance(data, dict):
+        return "N/A"
+    wikidata_url = ((data.get("ids") or {}).get("wikidata") or "").strip()
+    qid = wikidata_url.rstrip("/").split("/")[-1]
+    if not qid.startswith("Q"):
+        return "N/A"
+    wd_params = {
+        "action": "wbgetentities",
+        "ids": qid,
+        "props": "sitelinks",
+        "sitefilter": "enwiki",
+        "format": "json",
+    }
+    wd, wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=wd_params)
+    if wd_status == 429:
+        time.sleep(2)
+        wd, wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=wd_params)
+    entity = ((wd or {}).get("entities") or {}).get(qid) or {}
+    title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
+    if not title:
+        return "N/A"
+    summary_url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(title.replace(" ", "_"), safe="")
+    summary, summary_status = _public_get_json(summary_url)
+    if summary_status == 429:
+        time.sleep(2)
+        summary, summary_status = _public_get_json(summary_url)
+    extract = (summary.get("extract") or "").strip() if isinstance(summary, dict) else ""
+    if not extract:
+        return "N/A"
+    if len(extract) > 1000:
+        extract = extract[:997].rstrip() + "..."
+    return extract
+
+
+def _description_already_set(row):
+    if "Brief description" not in row:
+        return False
+    val = row.get("Brief description")
+    if val is None:
+        return False
+    try:
+        if pd.isna(val):
+            return False
+    except TypeError:
+        pass
+    text = str(val).strip()
+    return bool(text) and text.lower() != "nan"
+
+
+def _issn_for_description(row):
+    for key in ("Queried ISSN", "Query", "ISSN", "eISSN"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            if pd.isna(raw):
+                continue
+        except TypeError:
+            pass
+        if clean_issn(str(raw)):
+            return str(raw).strip()
+    return None
+
+
+def _place_brief_description(row, description):
+    description = description or "N/A"
+    items = [(k, v) for k, v in row.items() if k != "Brief description"]
+    keys = [k for k, _ in items]
+    if "Journal Title" in keys:
+        insert_at = keys.index("Journal Title") + 1
+    elif "Status" in keys:
+        insert_at = keys.index("Status")
+    else:
+        insert_at = len(items)
+    items.insert(insert_at, ("Brief description", description))
+    return dict(items)
+
+
+def attach_brief_descriptions(rows, progress_bar, status_text, cache=None):
+    """Add a Brief description column. cache maps cleaned ISSN -> text across platforms."""
+    if not rows:
+        return rows
+    if cache is None:
+        cache = {}
+    total = len(rows)
+    for i, row in enumerate(rows):
+        if _description_already_set(row):
+            rows[i] = _place_brief_description(row, str(row.get("Brief description")).strip())
+            if progress_bar is not None:
+                progress_bar.progress((i + 1) / total)
+            continue
+        issn = _issn_for_description(row)
+        label = issn or row.get("Query") or row.get("Journal Title") or ""
+        status_text.text(f"Brief description {i + 1} of {total}: {str(label)[:40]}")
+        if not issn:
+            text = "N/A"
+        else:
+            key = clean_issn(issn)
+            if key not in cache:
+                cache[key] = fetch_journal_brief_description(issn)
+                time.sleep(0.25)
+            text = cache[key]
+        rows[i] = _place_brief_description(row, text)
+        if progress_bar is not None:
+            progress_bar.progress((i + 1) / total)
+    return rows
+
+
 def run_batched_journal_fetch(
     items,
     fetch_chunk_fn,
@@ -1631,8 +1836,8 @@ if app_mode == "Unified citation search":
         st.markdown("Search citation counts from **Web of Science**, **Scopus**, and **Google Scholar** in one go.")
         st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
     else:
-        st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go.")
-        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}.")
+        st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go, with a brief description for each ISSN.")
+        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. Description is the English Wikipedia summary when one exists.")
 
     if not api_unlocked:
         _locked_view(api_reminder)
@@ -1734,6 +1939,19 @@ if app_mode == "Unified citation search":
                         )
                     else:
                         scopus_journal_data = []
+                    desc_cache = {}
+                    if wos_journal_rows:
+                        status_text.text("Fetching brief descriptions for WoS results...")
+                        wos_journal_rows = attach_brief_descriptions(
+                            wos_journal_rows, progress_bar, status_text, desc_cache
+                        )
+                        _save_partial_rows(job_id, "wos", wos_journal_rows)
+                    if scopus_journal_data:
+                        status_text.text("Fetching brief descriptions for Scopus results...")
+                        scopus_journal_data = attach_brief_descriptions(
+                            scopus_journal_data, progress_bar, status_text, desc_cache
+                        )
+                        _save_partial_rows(job_id, "scopus", scopus_journal_data)
                     status_text.success(f"✅ Finished: WoS {len(wos_journal_rows)} records, Scopus {len(scopus_journal_data)} records.")
                     st.session_state["unified_wos_journal_df"] = pd.DataFrame(wos_journal_rows) if wos_journal_rows else None
                     st.session_state["unified_scopus_journal_df"] = pd.DataFrame(scopus_journal_data) if scopus_journal_data else None
@@ -1984,8 +2202,8 @@ elif app_mode == "Web of Science":
                     )
 
         else:
-            st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**.")
-            st.caption("Enter one ISSN or title per line.")
+            st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**, plus a brief description.")
+            st.caption("Enter one ISSN or title per line. Description is the English Wikipedia summary for the ISSN when one exists.")
             raw_journal_text = st.text_area(
                 "📋 Enter ISSNs or journal titles (one per line)",
                 height=200,
@@ -2053,6 +2271,11 @@ elif app_mode == "Web of Science":
                             status_text,
                             resume=wos_resume,
                         )
+                        status_text.text("Fetching brief descriptions...")
+                        journal_rows = attach_brief_descriptions(
+                            journal_rows, progress_bar, status_text
+                        )
+                        _save_partial_rows(job_id, "wos", journal_rows)
                         status_text.success(f"✅ Finished processing {len(journal_rows)} records!")
                         st.session_state["wos_journal_df"] = pd.DataFrame(journal_rows)
 
@@ -2142,8 +2365,8 @@ elif app_mode == "Scopus":
                 )
 
         else:
-            st.markdown("Fetch **journal metrics** (CiteScore, SNIP, SJR, subject areas) by **ISSN**.")
-            st.caption("Enter one ISSN per line (with or without hyphen).")
+            st.markdown("Fetch **journal metrics** (CiteScore, SNIP, SJR, subject areas) and a brief description by **ISSN**.")
+            st.caption("Enter one ISSN per line (with or without hyphen). Description is the English Wikipedia summary when one exists.")
             raw_issn_text = st.text_area("📋 Enter ISSNs (one per line)", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
             scopus_citescore_year = st.text_input(
@@ -2201,6 +2424,11 @@ elif app_mode == "Scopus":
                         status_text,
                         resume=scopus_resume,
                     )
+                    status_text.text("Fetching brief descriptions...")
+                    journal_data = attach_brief_descriptions(
+                        journal_data, progress_bar, status_text
+                    )
+                    _save_partial_rows(job_id, "scopus", journal_data)
                     status_text.success(f"✅ Finished processing {len(journal_data)} records!")
                     st.session_state["scopus_journal_df"] = pd.DataFrame(journal_data)
 
