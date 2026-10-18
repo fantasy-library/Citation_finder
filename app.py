@@ -1,3 +1,4 @@
+import html
 import streamlit as st
 import requests
 import pandas as pd
@@ -1338,11 +1339,23 @@ def _save_partial_rows(job_id, platform, rows):
 
 
 # ==========================================
-# Journal brief description (OpenAlex ISSN -> Wikidata -> Wikipedia)
-# No extra API key. Filled on the same ISSN searches that use WOS/Scopus keys.
+# Journal brief description
+# Wikipedia first. If that has no article, harvest a short overview from the
+# journal homepage (OpenAlex), the DOAJ aims page, or the Wikidata official site.
+# Kept under 300 words. No extra API key.
 # ==========================================
 _PUBLIC_UA = "AcademicDatabaseSearch/1.0 (journal brief description; local research tool)"
+_HTML_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+_DESC_MAX_WORDS = 299
 _public_http = None
+_GARBAGE_SENTENCE = re.compile(
+    r"^(indexed in|indexing|impact factor|journal impact factor|editor-in-chief|publishing model|submission to|downloads\b)\b",
+    re.I,
+)
+_GARBAGE_PAGE = re.compile(
+    r"\b(cookie policy|enable javascript|access denied|just a moment|sign in to|subscribe to continue|captcha|are you a robot|403 forbidden|page not found|cookies_not_supported)\b",
+    re.I,
+)
 
 
 class _OSTrustAdapter(requests.adapters.HTTPAdapter):
@@ -1421,8 +1434,190 @@ def _public_get_json(url, params=None, timeout=30):
         return None, resp.status_code
 
 
+def _curl_get_text(url, timeout=25, user_agent=None):
+    exe = _curl_executable()
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                exe, "-fsSL", "--max-time", str(int(timeout)),
+                "--max-filesize", "2000000",
+                "-A", user_agent or _HTML_UA,
+                "-H", "Accept: text/html,application/xhtml+xml",
+                url,
+            ],
+            capture_output=True,
+            timeout=timeout + 10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def _public_get_html(url, timeout=25):
+    headers = {"User-Agent": _HTML_UA, "Accept": "text/html,application/xhtml+xml"}
+    try:
+        resp = _os_trust_session().get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if resp.status_code == 200 and resp.text and len(resp.text) > 200:
+            return resp.text[:500000]
+    except requests.RequestException:
+        pass
+    text = _curl_get_text(url, timeout=timeout)
+    if text and len(text) > 200:
+        return text[:500000]
+    return None
+
+
+def _normalize_prose(text):
+    text = html.unescape(text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text).strip(" \t\r\n\"'")
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    kept = []
+    for part in parts:
+        part = part.strip(" -|")
+        if not part or _GARBAGE_SENTENCE.search(part):
+            continue
+        kept.append(part)
+    return " ".join(kept).strip()
+
+
+def _limit_description(text):
+    """Return a cleaned overview under 300 words, or '' when the text is not a description."""
+    text = _normalize_prose(text)
+    if not text or _GARBAGE_PAGE.search(text):
+        return ""
+    if text.count("|") >= 2 and len(text.split()) < 25:
+        return ""
+    words = text.split()
+    if len(words) < 8 or len(text) < 40:
+        return ""
+    letters = sum(ch.isalpha() for ch in text)
+    if letters / max(len(text), 1) < 0.5:
+        return ""
+    if len(words) >= 300:
+        words = words[:_DESC_MAX_WORDS]
+        text = " ".join(words).rstrip(" ,;:")
+        if not text.endswith((".", "!", "?")):
+            cut = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+            if cut >= 80:
+                text = text[: cut + 1]
+    return text
+
+
+def _collect_jsonld_descriptions(node, out):
+    if isinstance(node, list):
+        for item in node:
+            _collect_jsonld_descriptions(item, out)
+        return
+    if not isinstance(node, dict):
+        return
+    desc = node.get("description")
+    if isinstance(desc, str):
+        out.append(desc)
+    elif isinstance(desc, dict):
+        value = desc.get("@value") or desc.get("value")
+        if isinstance(value, str):
+            out.append(value)
+    for key in ("@graph", "mainEntity", "about"):
+        if key in node:
+            _collect_jsonld_descriptions(node[key], out)
+
+
+def _meta_descriptions(page_html):
+    found = []
+    for tag in re.findall(r"<meta\s+[^>]*>", page_html, flags=re.I):
+        attrs = {
+            key.lower(): html.unescape(value)
+            for key, value in re.findall(r"([:\w-]+)\s*=\s*[\"'](.*?)[\"']", tag, flags=re.I | re.S)
+        }
+        name = (attrs.get("name") or attrs.get("property") or "").lower()
+        if name in {"description", "og:description"} and attrs.get("content"):
+            found.append(attrs["content"])
+    return found
+
+
+def _harvest_page_description(url):
+    if not url or not str(url).startswith("http"):
+        return ""
+    page_html = _public_get_html(str(url).strip())
+    if not page_html:
+        return ""
+    jsonld = []
+    for block in re.findall(
+        r"<script[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+        page_html,
+        flags=re.I | re.S,
+    ):
+        try:
+            _collect_jsonld_descriptions(json.loads(block), jsonld)
+        except json.JSONDecodeError:
+            continue
+    cleaned = []
+    for raw in jsonld + _meta_descriptions(page_html):
+        text = _limit_description(raw)
+        if text:
+            cleaned.append(text)
+    if not cleaned:
+        return ""
+    cleaned.sort(key=lambda item: (not item.rstrip().endswith("..."), len(item.split())), reverse=True)
+    return cleaned[0]
+
+
+def _doaj_aims_url(hyphen):
+    data, status = _public_get_json(f"https://doaj.org/api/search/journals/issn:{hyphen}")
+    if status == 429:
+        time.sleep(2)
+        data, _status = _public_get_json(f"https://doaj.org/api/search/journals/issn:{hyphen}")
+    results = (data or {}).get("results") if isinstance(data, dict) else None
+    if not results:
+        return ""
+    ref = ((results[0].get("bibjson") or {}).get("ref") or {})
+    return (ref.get("aims_scope") or ref.get("journal") or "").strip()
+
+
+def _wikidata_official_url(entity):
+    claims = (entity or {}).get("claims") or {}
+    for claim in claims.get("P856") or []:
+        value = ((claim.get("mainsnak") or {}).get("datavalue") or {}).get("value")
+        if isinstance(value, str) and value.startswith("http"):
+            return value.strip()
+    return ""
+
+
+def _unique_urls(urls):
+    seen = set()
+    ordered = []
+    for url in urls:
+        if not url:
+            continue
+        key = url.strip().rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(url.strip())
+    return ordered
+
+
+def _wikipedia_extract(title):
+    if not title:
+        return ""
+    summary_url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(title.replace(" ", "_"), safe="")
+    summary, summary_status = _public_get_json(summary_url)
+    if summary_status == 429:
+        time.sleep(2)
+        summary, _summary_status = _public_get_json(summary_url)
+    if not isinstance(summary, dict):
+        return ""
+    return (summary.get("extract") or "").strip()
+
+
 def fetch_journal_brief_description(issn):
-    """English Wikipedia lead paragraph for an ISSN, or 'N/A' when none exists."""
+    """Short journal overview by ISSN. Wikipedia first, then the publisher page."""
     cleaned = clean_issn(issn)
     if not cleaned:
         return "N/A"
@@ -1432,37 +1627,46 @@ def fetch_journal_brief_description(issn):
         time.sleep(2)
         data, status = _public_get_json(f"https://api.openalex.org/sources/issn:{hyphen}")
     if not isinstance(data, dict):
-        return "N/A"
+        data = {}
+
+    homepage = (data.get("homepage_url") or "").strip()
     wikidata_url = ((data.get("ids") or {}).get("wikidata") or "").strip()
     qid = wikidata_url.rstrip("/").split("/")[-1]
-    if not qid.startswith("Q"):
-        return "N/A"
-    wd_params = {
-        "action": "wbgetentities",
-        "ids": qid,
-        "props": "sitelinks",
-        "sitefilter": "enwiki",
-        "format": "json",
-    }
-    wd, wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=wd_params)
-    if wd_status == 429:
-        time.sleep(2)
+    official_site = ""
+    wiki_text = ""
+    if qid.startswith("Q"):
+        wd_params = {
+            "action": "wbgetentities",
+            "ids": qid,
+            "props": "sitelinks|claims",
+            "sitefilter": "enwiki",
+            "format": "json",
+        }
         wd, wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=wd_params)
-    entity = ((wd or {}).get("entities") or {}).get(qid) or {}
-    title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
-    if not title:
-        return "N/A"
-    summary_url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(title.replace(" ", "_"), safe="")
-    summary, summary_status = _public_get_json(summary_url)
-    if summary_status == 429:
-        time.sleep(2)
-        summary, summary_status = _public_get_json(summary_url)
-    extract = (summary.get("extract") or "").strip() if isinstance(summary, dict) else ""
-    if not extract:
-        return "N/A"
-    if len(extract) > 1000:
-        extract = extract[:997].rstrip() + "..."
-    return extract
+        if wd_status == 429:
+            time.sleep(2)
+            wd, _wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=wd_params)
+        entity = ((wd or {}).get("entities") or {}).get(qid) or {}
+        title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
+        wiki_text = _wikipedia_extract(title)
+        official_site = _wikidata_official_url(entity)
+
+    text = _limit_description(wiki_text)
+    if text:
+        return text
+
+    tried = []
+    for page_url in _unique_urls([homepage, official_site]):
+        tried.append(page_url.strip().rstrip("/").lower())
+        harvested = _harvest_page_description(page_url)
+        if harvested:
+            return harvested
+    aims_url = _doaj_aims_url(hyphen)
+    if aims_url and aims_url.strip().rstrip("/").lower() not in tried:
+        harvested = _harvest_page_description(aims_url)
+        if harvested:
+            return harvested
+    return "N/A"
 
 
 def _description_already_set(row):
@@ -1477,7 +1681,7 @@ def _description_already_set(row):
     except TypeError:
         pass
     text = str(val).strip()
-    return bool(text) and text.lower() != "nan"
+    return bool(text) and text.lower() not in {"nan", "n/a", "na", "none"}
 
 
 def _issn_for_description(row):
@@ -1837,7 +2041,7 @@ if app_mode == "Unified citation search":
         st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
     else:
         st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go, with a brief description for each ISSN.")
-        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. Description is the English Wikipedia summary when one exists.")
+        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. Description is a short overview (under 300 words) from Wikipedia, or from the journal webpage when Wikipedia has no article.")
 
     if not api_unlocked:
         _locked_view(api_reminder)
@@ -2203,7 +2407,7 @@ elif app_mode == "Web of Science":
 
         else:
             st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**, plus a brief description.")
-            st.caption("Enter one ISSN or title per line. Description is the English Wikipedia summary for the ISSN when one exists.")
+            st.caption("Enter one ISSN or title per line. Description is a short overview (under 300 words) from Wikipedia, or from the journal webpage when Wikipedia has no article.")
             raw_journal_text = st.text_area(
                 "📋 Enter ISSNs or journal titles (one per line)",
                 height=200,
@@ -2366,7 +2570,7 @@ elif app_mode == "Scopus":
 
         else:
             st.markdown("Fetch **journal metrics** (CiteScore, SNIP, SJR, subject areas) and a brief description by **ISSN**.")
-            st.caption("Enter one ISSN per line (with or without hyphen). Description is the English Wikipedia summary when one exists.")
+            st.caption("Enter one ISSN per line (with or without hyphen). Description is a short overview (under 300 words) from Wikipedia, or from the journal webpage when Wikipedia has no article.")
             raw_issn_text = st.text_area("📋 Enter ISSNs (one per line)", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
             scopus_citescore_year = st.text_input(
