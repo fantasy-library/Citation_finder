@@ -555,6 +555,7 @@ def _parse_wos_journal_entry(entry, query):
         or entry.get("jcr_year")
         or None
     )
+    jif_label = f"JIF ({jcr_year_val})" if jcr_year_val else "JIF"
     return {
         "Journal Title": title,
         "JCR ID": jcr_id,
@@ -563,7 +564,7 @@ def _parse_wos_journal_entry(entry, query):
         "eISSN": eissn,
         "Publisher": publisher,
         "Categories": cat_str,
-        "JIF": jif,
+        jif_label: jif,
         "JIF Percentile": jif_percentile or "N/A",
         "JIF Quartile": jif_quartile or "N/A",
         "JCI": jci,
@@ -575,22 +576,31 @@ def _parse_wos_journal_entry(entry, query):
 
 
 def calendar_jcr_year(when=None):
-    """JCR year Y is released in mid-June of calendar year Y. Before that, the previous release is current."""
+    """Named JCR release. The June 2026 release is called JCR 2026."""
     when = when or time.gmtime()
     if (when.tm_mon, when.tm_mday) >= (6, 17):
         return when.tm_year
     return when.tm_year - 1
 
 
+def latest_jif_year(when=None):
+    """Year of the newest Journal Impact Factor.
+
+    The June release publishes the previous year's JIF. In October 2026 that is 2025;
+    the 2026 JIF is not published until the June 2027 release.
+    """
+    return calendar_jcr_year(when) - 1
+
+
 _resolved_jcr_years = {}
 
 
 def resolve_latest_jcr_year(api_key):
-    """Latest JCR year this key can read. Steps back if the June release is not in the API yet."""
+    """Latest year that has a Journal Impact Factor. Steps back if that year is not in the API yet."""
     token = (api_key or "").strip()
     if token in _resolved_jcr_years:
         return _resolved_jcr_years[token]
-    year = calendar_jcr_year()
+    year = latest_jif_year()
     resolved = year
     if token:
         headers = {"X-ApiKey": token}
@@ -2517,7 +2527,7 @@ if app_mode == "Unified citation search":
         st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
     else:
         st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go, with a brief description for each ISSN.")
-        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. JCR year follows the latest June release. A short description is still filled when a journal is not in Web of Science or Scopus.")
+        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. Journal Impact Factor uses the latest published year (currently {latest_jif_year()}). A short description is still filled when a journal is not in Web of Science or Scopus.")
 
     if not api_unlocked:
         _locked_view(api_reminder)
@@ -2892,15 +2902,15 @@ elif app_mode == "Web of Science":
 
         else:
             st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**, plus a brief description.")
-            st.caption("Enter one ISSN or title per line. Leave the year blank to use the latest JCR release. A short description is still filled when a journal is not in Web of Science.")
+            st.caption(f"Enter one ISSN or title per line. Leave the year blank to use the latest Journal Impact Factor year ({latest_jif_year()}). The JIF column is labeled with that year. A short description is still filled when a journal is not in Web of Science.")
             raw_journal_text = st.text_area(
                 "📋 Enter ISSNs or journal titles (one per line)",
                 height=200,
                 placeholder="0000-0000\n1363-2434\nJournal of Marketing",
                 key="wos_journal_queries",
             )
-            _jcr_default = str(calendar_jcr_year())
-            jcr_year = st.text_input("JCR year (leave blank for latest)", value="", placeholder=_jcr_default, key="wos_jcr_year")
+            _jcr_default = str(latest_jif_year())
+            jcr_year = st.text_input("JCR year (leave blank for latest JIF year)", value="", placeholder=_jcr_default, key="wos_jcr_year")
             edition_options = ["SCIE", "SSCI", "AHCI", "ESCI"]
             selected_editions = st.multiselect(
                 "Edition filter (optional, Web of Science index):",
