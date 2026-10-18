@@ -592,6 +592,18 @@ def latest_jif_year(when=None):
     return calendar_jcr_year(when) - 1
 
 
+def latest_citescore_year(when=None):
+    """Year of the newest complete CiteScore.
+
+    Scopus publishes CiteScore for year Y in early June of year Y+1.
+    In October 2026 that is 2025. The 2026 score arrives in June 2027.
+    """
+    when = when or time.gmtime()
+    if (when.tm_mon, when.tm_mday) >= (6, 5):
+        return when.tm_year - 1
+    return when.tm_year - 2
+
+
 _resolved_jcr_years = {}
 
 
@@ -962,9 +974,12 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
 
     for i, issn in enumerate(issns):
         status_text.text(f"Fetching ISSN {i+1} of {total}: {issn}...")
-        url = f"{base_url}/{issn}?apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json"
+        # ENHANCED includes citeScoreCurrentMetric, which Scopus defines as the latest complete year.
+        # A typed year asks for that year. A blank year omits date so the current metric moves forward
+        # when Scopus publishes the next annual CiteScore.
+        url = f"{base_url}/{issn}?apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json&view=ENHANCED"
         if citescore_year:
-            url += f"&view=ENHANCED&date={citescore_year}"
+            url += f"&date={citescore_year}"
 
         try:
             response = requests.get(url)
@@ -1032,12 +1047,17 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                         else:
                             cite_score = first
 
+                    cite_label = (
+                        f"CiteScore ({cite_score_year})"
+                        if str(cite_score_year).isdigit()
+                        else "CiteScore"
+                    )
                     results.append({
                         "Journal Title": entry.get("dc:title", "N/A"),
                         "Publisher": entry.get("dc:publisher", "N/A"),
                         "Print ISSN": entry.get("prism:issn", "N/A"),
                         "eISSN": entry.get("prism:eIssn", "N/A"),
-                        "CiteScore": cite_score,
+                        cite_label: cite_score,
                         "CiteScore Year": cite_score_year,
                         "SNIP": snip,
                         "SJR": sjr,
@@ -2544,8 +2564,9 @@ if app_mode == "Unified citation search":
             unified_scopus_year = st.text_input(
                 "Scopus CiteScore year (leave blank for latest)",
                 value="",
-                placeholder=str(max(1999, calendar_jcr_year() - 1)),
+                placeholder=str(latest_citescore_year()),
                 key="unified_scopus_citescore_year",
+                help=f"Blank uses Scopus's latest complete CiteScore, currently {latest_citescore_year()}. That year moves forward when the next annual score is published, usually in early June.",
             )
             unified_citescore_year_param = (unified_scopus_year or "").strip()
             unified_citescore_year_param = unified_citescore_year_param if unified_citescore_year_param.isdigit() else None
@@ -2573,7 +2594,7 @@ if app_mode == "Unified citation search":
                     jcr_year_val = str(resolve_latest_jcr_year(WOS_JOURNAL_API_KEY))
                     fp = _journal_job_fingerprint(
                         clean_issns,
-                        f"unified|{jcr_year_val}|{unified_citescore_year_param or ''}",
+                        f"unified|{jcr_year_val}|{unified_citescore_year_param or latest_citescore_year()}",
                     )
                     job_id = _prepare_journal_job(fp, "wos", unified_resume, unified=True)
                     st.session_state["unified_journal_job_id"] = job_id
@@ -3074,8 +3095,9 @@ elif app_mode == "Scopus":
             scopus_citescore_year = st.text_input(
                 "CiteScore year (leave blank for latest)",
                 value="",
-                placeholder=str(max(1999, calendar_jcr_year() - 1)),
+                placeholder=str(latest_citescore_year()),
                 key="scopus_citescore_year",
+                help=f"Blank uses Scopus's latest complete CiteScore, currently {latest_citescore_year()}. That year moves forward when the next annual score is published, usually in early June.",
             )
             citescore_year_param = (scopus_citescore_year or "").strip()
             citescore_year_param = citescore_year_param if citescore_year_param.isdigit() else None
@@ -3100,7 +3122,7 @@ elif app_mode == "Scopus":
                 if not clean_issns:
                     st.warning("Please enter valid 8-character ISSNs (with or without hyphen).")
                 else:
-                    fp = _journal_job_fingerprint(clean_issns, f"scopus|{citescore_year_param or ''}")
+                    fp = _journal_job_fingerprint(clean_issns, f"scopus|{citescore_year_param or latest_citescore_year()}")
                     job_id = _prepare_journal_job(fp, "scopus", scopus_resume)
                     st.session_state["scopus_journal_job_id"] = job_id
 
