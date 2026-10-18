@@ -574,7 +574,57 @@ def _parse_wos_journal_entry(entry, query):
     }
 
 
-def fetch_wos_journal_data(queries, api_key, jcr_year, edition_filter, progress_bar, status_text):
+def calendar_jcr_year(when=None):
+    """JCR year Y is released in mid-June of calendar year Y. Before that, the previous release is current."""
+    when = when or time.gmtime()
+    if (when.tm_mon, when.tm_mday) >= (6, 17):
+        return when.tm_year
+    return when.tm_year - 1
+
+
+_resolved_jcr_years = {}
+
+
+def resolve_latest_jcr_year(api_key):
+    """Latest JCR year this key can read. Steps back if the June release is not in the API yet."""
+    token = (api_key or "").strip()
+    if token in _resolved_jcr_years:
+        return _resolved_jcr_years[token]
+    year = calendar_jcr_year()
+    resolved = year
+    if token:
+        headers = {"X-ApiKey": token}
+        for candidate in range(year, max(1996, year - 3), -1):
+            try:
+                resp = requests.get(
+                    f"{WOS_JOURNALS_BASE}/journals",
+                    headers=headers,
+                    params={"q": "0028-0836", "jcrYear": candidate, "jif": "gte:0", "limit": 1},
+                    timeout=30,
+                )
+            except requests.RequestException:
+                break
+            if resp.status_code != 200:
+                if resp.status_code in (400, 404):
+                    continue
+                break
+            try:
+                data = resp.json()
+            except ValueError:
+                break
+            hits = data.get("hits") or data.get("journalList") or data.get("journals") or data.get("data") or []
+            if isinstance(hits, dict):
+                hits = hits.get("journal") or hits.get("journals") or hits.get("hits") or []
+            if hits:
+                resolved = candidate
+                break
+    _resolved_jcr_years[token] = resolved
+    return resolved
+
+
+def fetch_wos_journal_data(
+    queries, api_key, jcr_year, edition_filter, progress_bar, status_text, include_metrics_filters=True
+):
     """Fetch JCR journal metrics by search query (ISSN or title). Uses WOS Journals API."""
     results = []
     total = len(queries)
@@ -594,12 +644,13 @@ def fetch_wos_journal_data(queries, api_key, jcr_year, edition_filter, progress_
         if jcr_year:
             year_int = int(jcr_year)
             params["jcrYear"] = year_int
-            # Turn on impact metrics (JIF/JCI), percentiles, and quartiles without over-filtering
-            params["jif"] = "gte:0"
-            params["jifPercentile"] = "gte:0 AND lte:100"
-            params["jifQuartile"] = "Q1;Q2;Q3;Q4"
-            params["jci"] = "gte:0"
-            params["jciPercentile"] = "gte:0 AND lte:100"
+            # These filters ask the API to return JIF and JCI. They also hide journals with no JIF.
+            if include_metrics_filters:
+                params["jif"] = "gte:0"
+                params["jifPercentile"] = "gte:0 AND lte:100"
+                params["jifQuartile"] = "Q1;Q2;Q3;Q4"
+                params["jci"] = "gte:0"
+                params["jciPercentile"] = "gte:0 AND lte:100"
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
             if response.status_code == 200:
@@ -718,27 +769,63 @@ def fetch_wos_journal_data(queries, api_key, jcr_year, edition_filter, progress_
     return results
 
 
+def _journal_misses(results):
+    return [i for i, row in enumerate(results) if row.get("Status") == "No journal found"]
+
+
+def _merge_journal_retries(results, indexes, retry_results):
+    for j, idx in enumerate(indexes):
+        if j < len(retry_results) and retry_results[j].get("Status") != "No journal found":
+            results[idx] = retry_results[j]
+
+
 def fetch_wos_journal_data_with_year_fallback(queries, api_key, jcr_year, edition_filter, progress_bar, status_text):
-    """Call fetch_wos_journal_data; if any result is 'No journal found', retry those with previous year and merge."""
+    """Fetch the requested JCR year, then journals with no JIF, then the previous JCR year."""
     results = fetch_wos_journal_data(queries, api_key, jcr_year, edition_filter, progress_bar, status_text)
     try:
         year_int = int(jcr_year)
     except (TypeError, ValueError):
         return results
-    if year_int <= 2024:
-        return results
-    failed_indices = [i for i, r in enumerate(results) if r.get("Status") == "No journal found"]
-    if not failed_indices:
-        return results
-    failed_queries = [queries[i] for i in failed_indices]
-    prev_year = str(year_int - 1)
-    status_text.text(f"Retrying {len(failed_queries)} not found with JCR year {prev_year}...")
-    retry_results = fetch_wos_journal_data(
-        failed_queries, api_key, prev_year, edition_filter, progress_bar, status_text
-    )
-    for j, idx in enumerate(failed_indices):
-        if j < len(retry_results) and retry_results[j].get("Status") != "No journal found":
-            results[idx] = retry_results[j]
+
+    missing = _journal_misses(results)
+    if missing:
+        status_text.text(f"Retrying {len(missing)} journals that have no Journal Impact Factor...")
+        retry_results = fetch_wos_journal_data(
+            [queries[i] for i in missing],
+            api_key,
+            str(year_int),
+            edition_filter,
+            progress_bar,
+            status_text,
+            include_metrics_filters=False,
+        )
+        _merge_journal_retries(results, missing, retry_results)
+
+    missing = _journal_misses(results)
+    if missing and year_int > 1997:
+        prev_year = str(year_int - 1)
+        status_text.text(f"Retrying {len(missing)} not in {year_int} with JCR year {prev_year}...")
+        retry_results = fetch_wos_journal_data(
+            [queries[i] for i in missing],
+            api_key,
+            prev_year,
+            edition_filter,
+            progress_bar,
+            status_text,
+        )
+        _merge_journal_retries(results, missing, retry_results)
+        missing = _journal_misses(results)
+        if missing:
+            retry_results = fetch_wos_journal_data(
+                [queries[i] for i in missing],
+                api_key,
+                prev_year,
+                edition_filter,
+                progress_bar,
+                status_text,
+                include_metrics_filters=False,
+            )
+            _merge_journal_retries(results, missing, retry_results)
     return results
 
 
@@ -1360,7 +1447,7 @@ def _save_partial_rows(job_id, platform, rows):
 _PUBLIC_UA = "AcademicDatabaseSearch/1.0 (journal brief description; local research tool)"
 _HTML_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 _DESC_MAX_WORDS = 299
-_DESC_VERSION = "4"
+_DESC_VERSION = "5"
 _public_http = None
 _GARBAGE_SENTENCE = re.compile(
     r"^(indexed in|indexing|impact factor|journal impact factor|editors?-in-?\s*chiefs?|publishing model|submission to|downloads\b|prof\.)\b|\bview all editors\b",
@@ -1805,6 +1892,61 @@ def _wikipedia_extract(title):
     return (summary.get("extract") or "").strip()
 
 
+def _wikipedia_search_extract(title):
+    """Exact English Wikipedia title, including 'Title (journal)', when Wikidata has no sitelink."""
+    title = " ".join(str(title or "").split())
+    if len(title) < 3:
+        return ""
+    data, status = _public_get_json(
+        "https://en.wikipedia.org/w/api.php",
+        params={
+            "action": "query",
+            "list": "search",
+            "srsearch": f'intitle:"{title}"',
+            "srlimit": "5",
+            "format": "json",
+        },
+    )
+    if status == 429:
+        time.sleep(2)
+        data, _status = _public_get_json(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": f'intitle:"{title}"',
+                "srlimit": "5",
+                "format": "json",
+            },
+        )
+    hits = ((data or {}).get("query") or {}).get("search") if isinstance(data, dict) else None
+    if not hits:
+        return ""
+    wanted = {
+        " ".join(title.lower().split()),
+        " ".join(f"{title} (journal)".lower().split()),
+    }
+    for hit in hits:
+        name = hit.get("title") or ""
+        if " ".join(name.lower().split()) in wanted:
+            return _wikipedia_extract(name)
+    return ""
+
+
+def _crossref_journal_title(issn):
+    """Journal title from Crossref when WoS, Scopus, and OpenAlex have no record."""
+    cleaned = clean_issn(issn)
+    if not cleaned:
+        return ""
+    hyphen = format_issn_for_wos(cleaned)
+    data, _status = _public_get_json(f"https://api.crossref.org/journals/{hyphen}")
+    message = (data or {}).get("message") if isinstance(data, dict) else None
+    if not isinstance(message, dict):
+        return ""
+    title = message.get("title") or ""
+    return title.strip() if isinstance(title, str) else ""
+
+
 def _openalex_source_by_issn(issn):
     cleaned = clean_issn(issn)
     if not cleaned:
@@ -1899,17 +2041,22 @@ def _description_from_source(data, issn_for_doaj=""):
 
 
 def fetch_journal_brief_description(issn=None, title=None):
-    """Short journal overview. ISSN first, then an exact journal-title match."""
+    """Short journal overview. Does not require the journal to be in WoS or Scopus."""
     source = _openalex_source_by_issn(issn) if issn else None
     text = _description_from_source(source or {}, issn or "") if (source or issn) else ""
     if text:
         return text
+    if not title and issn:
+        title = _crossref_journal_title(issn)
     if title and not clean_issn(str(title)):
         titled = _openalex_source_by_title(title)
         if titled and (not source or titled.get("id") != source.get("id")):
             text = _description_from_source(titled, (titled.get("issn_l") or ""))
             if text:
                 return text
+        text = _limit_description(_wikipedia_search_extract(title))
+        if text:
+            return text
     return "N/A"
 
 
@@ -1997,16 +2144,44 @@ def attach_brief_descriptions(rows, progress_bar, status_text, cache=None):
         label = issn or title or ""
         status_text.text(f"Brief description {i + 1} of {total}: {str(label)[:40]}")
         cache_key = clean_issn(issn) or f"title:{title.lower()}"
+        tried_key = f"tried:{cache_key}"
+        title_key = (title or "").lower()
         if not cache_key:
             text = "N/A"
-        else:
-            if cache_key not in cache:
-                cache[cache_key] = fetch_journal_brief_description(issn, title)
-                time.sleep(0.25)
+        elif cache.get(cache_key) not in (None, "N/A"):
             text = cache[cache_key]
+        elif cache.get(cache_key) == "N/A" and cache.get(tried_key) == title_key:
+            text = "N/A"
+        else:
+            # A miss with no title must not block a later row that has the journal name.
+            cache[cache_key] = fetch_journal_brief_description(issn, title)
+            cache[tried_key] = title_key
+            text = cache[cache_key]
+            time.sleep(0.25)
         rows[i] = _place_brief_description(row, text)
         if progress_bar is not None:
             progress_bar.progress((i + 1) / total)
+    return rows
+
+
+def _known_journal_titles(row_groups):
+    titles = {}
+    for rows in row_groups:
+        for row in rows or []:
+            issn = clean_issn(_issn_for_description(row) or "")
+            title = _title_for_description(row)
+            if issn and title and issn not in titles:
+                titles[issn] = title
+    return titles
+
+
+def _apply_known_journal_titles(rows, titles):
+    for row in rows or []:
+        if _title_for_description(row):
+            continue
+        issn = clean_issn(_issn_for_description(row) or "")
+        if issn and titles.get(issn):
+            row["Journal Title"] = titles[issn]
     return rows
 
 
@@ -2342,7 +2517,7 @@ if app_mode == "Unified citation search":
         st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
     else:
         st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go, with a brief description for each ISSN.")
-        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. Description is a short overview (under 300 words) from Wikipedia, or from the journal webpage when Wikipedia has no article.")
+        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. JCR year follows the latest June release. A short description is still filled when a journal is not in Web of Science or Scopus.")
 
     if not api_unlocked:
         _locked_view(api_reminder)
@@ -2359,10 +2534,11 @@ if app_mode == "Unified citation search":
             unified_scopus_year = st.text_input(
                 "Scopus CiteScore year (leave blank for latest)",
                 value="",
-                placeholder="2024",
+                placeholder=str(max(1999, calendar_jcr_year() - 1)),
                 key="unified_scopus_citescore_year",
             )
-            unified_citescore_year_param = (unified_scopus_year or "").strip() or None
+            unified_citescore_year_param = (unified_scopus_year or "").strip()
+            unified_citescore_year_param = unified_citescore_year_param if unified_citescore_year_param.isdigit() else None
 
             st.caption(
                 f"Large lists are processed in batches of **{JOURNAL_BATCH_SIZE}** ISSNs. "
@@ -2384,8 +2560,7 @@ if app_mode == "Unified citation search":
                 if not clean_issns:
                     st.warning("Please enter valid 8-character ISSNs (with or without hyphen).")
                 else:
-                    _y = time.gmtime().tm_year
-                    jcr_year_val = str(max(2024, _y - 2))
+                    jcr_year_val = str(resolve_latest_jcr_year(WOS_JOURNAL_API_KEY))
                     fp = _journal_job_fingerprint(
                         clean_issns,
                         f"unified|{jcr_year_val}|{unified_citescore_year_param or ''}",
@@ -2445,6 +2620,9 @@ if app_mode == "Unified citation search":
                     else:
                         scopus_journal_data = []
                     desc_cache = {}
+                    known_titles = _known_journal_titles([wos_journal_rows, scopus_journal_data])
+                    _apply_known_journal_titles(wos_journal_rows, known_titles)
+                    _apply_known_journal_titles(scopus_journal_data, known_titles)
                     if wos_journal_rows:
                         status_text.text("Fetching brief descriptions for WoS results...")
                         wos_journal_rows = attach_brief_descriptions(
@@ -2714,14 +2892,14 @@ elif app_mode == "Web of Science":
 
         else:
             st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**, plus a brief description.")
-            st.caption("Enter one ISSN or title per line. Description is a short overview (under 300 words) from Wikipedia, or from the journal webpage when Wikipedia has no article.")
+            st.caption("Enter one ISSN or title per line. Leave the year blank to use the latest JCR release. A short description is still filled when a journal is not in Web of Science.")
             raw_journal_text = st.text_area(
                 "📋 Enter ISSNs or journal titles (one per line)",
                 height=200,
                 placeholder="0000-0000\n1363-2434\nJournal of Marketing",
                 key="wos_journal_queries",
             )
-            _jcr_default = str(max(2024, time.gmtime().tm_year - 2))
+            _jcr_default = str(calendar_jcr_year())
             jcr_year = st.text_input("JCR year (leave blank for latest)", value="", placeholder=_jcr_default, key="wos_jcr_year")
             edition_options = ["SCIE", "SSCI", "AHCI", "ESCI"]
             selected_editions = st.multiselect(
@@ -2753,7 +2931,7 @@ elif app_mode == "Web of Science":
                     if not queries:
                         st.warning("Please enter at least one ISSN or journal title.")
                     else:
-                        jcr_year_val = (jcr_year or "").strip() or str(max(2024, time.gmtime().tm_year - 2))
+                        jcr_year_val = (jcr_year or "").strip() or str(resolve_latest_jcr_year(WOS_JOURNAL_API_KEY))
                         edition_filter = ";".join(selected_editions) if selected_editions else None
                         fp = _journal_job_fingerprint(queries, f"wos|{jcr_year_val}|{edition_filter or ''}")
                         job_id = _prepare_journal_job(fp, "wos", wos_resume)
@@ -2880,16 +3058,17 @@ elif app_mode == "Scopus":
 
         else:
             st.markdown("Fetch **journal metrics** (CiteScore, SNIP, SJR, subject areas) and a brief description by **ISSN**.")
-            st.caption("Enter one ISSN per line (with or without hyphen). Description is a short overview (under 300 words) from Wikipedia, or from the journal webpage when Wikipedia has no article.")
+            st.caption("Enter one ISSN per line (with or without hyphen). A short description is still filled when the journal is not in Scopus.")
             raw_issn_text = st.text_area("📋 Enter ISSNs (one per line)", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
             scopus_citescore_year = st.text_input(
                 "CiteScore year (leave blank for latest)",
                 value="",
-                placeholder="2024",
+                placeholder=str(max(1999, calendar_jcr_year() - 1)),
                 key="scopus_citescore_year",
             )
-            citescore_year_param = (scopus_citescore_year or "").strip() or None
+            citescore_year_param = (scopus_citescore_year or "").strip()
+            citescore_year_param = citescore_year_param if citescore_year_param.isdigit() else None
 
             st.caption(
                 f"Large lists are processed in batches of **{JOURNAL_BATCH_SIZE}**. "
