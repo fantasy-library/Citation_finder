@@ -2130,9 +2130,10 @@ _hide_uploader_limit_script = """
 </script>
 """
 # st.components.v1.html is removed after 2026-06-01; st.iframe is the replacement.
-# Older Streamlit releases only have the components helper.
+# st.iframe rejects height=0, so size the frame to its (empty) content.
+# Older Streamlit releases only have the components helper, which does allow 0.
 if hasattr(st, "iframe"):
-    st.iframe(_hide_uploader_limit_script, height=0)
+    st.iframe(_hide_uploader_limit_script, width="content", height="content")
 else:
     import streamlit.components.v1 as components
 
