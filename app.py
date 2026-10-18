@@ -17,11 +17,6 @@ from urllib.parse import quote, unquote, urlencode
 JOURNAL_BATCH_SIZE = 200
 
 try:
-    import streamlit.components.v1 as components
-except ImportError:
-    components = None
-
-try:
     from serpapi import GoogleSearch as SerpApiGoogleSearch
     SERPAPI_AVAILABLE = True
 except ImportError:
@@ -465,8 +460,20 @@ def _parse_wos_journal_entry(entry, query):
         or "N/A"
     )
     jcr_id = entry.get("id") or entry.get("jcrAbbrev") or "N/A"
-    issn = entry.get("issn") or "N/A"
-    eissn = entry.get("eissn") or entry.get("eIssn") or "N/A"
+    issn = entry.get("issn") or entry.get("print_issn") or entry.get("printIssn") or "N/A"
+    eissn = (
+        entry.get("eissn")
+        or entry.get("eIssn")
+        or entry.get("e_issn")
+        or entry.get("electronic_issn")
+        or "N/A"
+    )
+    if isinstance(issn, (list, tuple)) and issn:
+        issn = issn[0]
+    if isinstance(eissn, (list, tuple)) and eissn:
+        eissn = eissn[0]
+    issn = issn if isinstance(issn, str) else "N/A"
+    eissn = eissn if isinstance(eissn, str) else "N/A"
     publisher = entry.get("publisher") or "N/A"
     categories = entry.get("categories") or entry.get("category") or []
     if isinstance(categories, list):
@@ -829,11 +836,17 @@ def extract_dois_from_df(df):
 # SCOPUS – Journal metrics by ISSN (Serial Title API)
 # ==========================================
 def clean_issn(issn_str):
-    """Normalize ISSN: strip whitespace and hyphens, return 8-char uppercase or None."""
+    """Normalize an ISSN. Returns 8 characters (7 digits plus a check digit) or None.
+
+    A title such as "3 Biotech" is 8 letters after spaces are removed, so the
+    value must actually be an ISSN and not just 8 characters long.
+    """
     if not issn_str or not isinstance(issn_str, str):
         return None
     cleaned = re.sub(r"[-\s]", "", issn_str.strip().upper())
-    return cleaned if len(cleaned) == 8 else None
+    if not re.fullmatch(r"\d{7}[\dX]", cleaned):
+        return None
+    return cleaned
 
 
 def format_issn_for_wos(issn_clean):
@@ -1457,18 +1470,34 @@ def _curl_get_text(url, timeout=25, user_agent=None):
     return proc.stdout.decode("utf-8", errors="replace")
 
 
+def _html_has_description(page):
+    if not page:
+        return False
+    lowered = page.lower()
+    return (
+        "application/ld+json" in lowered
+        or 'name="description"' in lowered
+        or "property=\"og:description\"" in lowered
+    )
+
+
 def _public_get_html(url, timeout=25):
     headers = {"User-Agent": _HTML_UA, "Accept": "text/html,application/xhtml+xml"}
+    bodies = []
     try:
         resp = _os_trust_session().get(url, headers=headers, timeout=timeout, allow_redirects=True)
         if resp.status_code == 200 and resp.text and len(resp.text) > 200:
-            return resp.text[:500000]
+            bodies.append(resp.text[:500000])
     except requests.RequestException:
         pass
-    text = _curl_get_text(url, timeout=timeout)
-    if text and len(text) > 200:
-        return text[:500000]
-    return None
+    if not any(_html_has_description(body) for body in bodies):
+        curled = _curl_get_text(url, timeout=timeout)
+        if curled and len(curled) > 200:
+            bodies.append(curled[:500000])
+    for body in bodies:
+        if _html_has_description(body):
+            return body
+    return bodies[-1] if bodies else None
 
 
 def _normalize_prose(text):
@@ -1616,19 +1645,53 @@ def _wikipedia_extract(title):
     return (summary.get("extract") or "").strip()
 
 
-def fetch_journal_brief_description(issn):
-    """Short journal overview by ISSN. Wikipedia first, then the publisher page."""
+def _openalex_source_by_issn(issn):
     cleaned = clean_issn(issn)
     if not cleaned:
-        return "N/A"
+        return None
     hyphen = format_issn_for_wos(cleaned)
     data, status = _public_get_json(f"https://api.openalex.org/sources/issn:{hyphen}")
     if status == 429:
         time.sleep(2)
         data, status = _public_get_json(f"https://api.openalex.org/sources/issn:{hyphen}")
+    if not isinstance(data, dict) or not data.get("id"):
+        return None
+    return data
+
+
+def _titles_match(left, right):
+    return " ".join(str(left or "").lower().split()) == " ".join(str(right or "").lower().split())
+
+
+def _openalex_source_by_title(title):
+    title = " ".join(str(title or "").split())
+    if len(title) < 3:
+        return None
+    data, status = _public_get_json(
+        "https://api.openalex.org/sources",
+        params={"search": title, "per_page": 5},
+    )
+    if status == 429:
+        time.sleep(2)
+        data, status = _public_get_json(
+            "https://api.openalex.org/sources",
+            params={"search": title, "per_page": 5},
+        )
+    results = (data or {}).get("results") if isinstance(data, dict) else None
+    if not results:
+        return None
+    for item in results:
+        names = [item.get("display_name") or ""]
+        names.extend(item.get("alternate_titles") or [])
+        if any(_titles_match(title, name) for name in names):
+            return item
+    return None
+
+
+def _description_from_source(data, issn_for_doaj=""):
+    """Wikipedia overview, then the journal homepage, then DOAJ."""
     if not isinstance(data, dict):
         data = {}
-
     homepage = (data.get("homepage_url") or "").strip()
     wikidata_url = ((data.get("ids") or {}).get("wikidata") or "").strip()
     qid = wikidata_url.rstrip("/").split("/")[-1]
@@ -1647,8 +1710,8 @@ def fetch_journal_brief_description(issn):
             time.sleep(2)
             wd, _wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=wd_params)
         entity = ((wd or {}).get("entities") or {}).get(qid) or {}
-        title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
-        wiki_text = _wikipedia_extract(title)
+        wiki_title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
+        wiki_text = _wikipedia_extract(wiki_title)
         official_site = _wikidata_official_url(entity)
 
     text = _limit_description(wiki_text)
@@ -1661,11 +1724,31 @@ def fetch_journal_brief_description(issn):
         harvested = _harvest_page_description(page_url)
         if harvested:
             return harvested
-    aims_url = _doaj_aims_url(hyphen)
-    if aims_url and aims_url.strip().rstrip("/").lower() not in tried:
-        harvested = _harvest_page_description(aims_url)
-        if harvested:
-            return harvested
+
+    hyphen = format_issn_for_wos(clean_issn(issn_for_doaj) or "")
+    if not hyphen and data.get("issn_l"):
+        hyphen = format_issn_for_wos(clean_issn(str(data.get("issn_l"))) or "")
+    if hyphen and len(clean_issn(hyphen) or "") == 8:
+        aims_url = _doaj_aims_url(hyphen)
+        if aims_url and aims_url.strip().rstrip("/").lower() not in tried:
+            harvested = _harvest_page_description(aims_url)
+            if harvested:
+                return harvested
+    return ""
+
+
+def fetch_journal_brief_description(issn=None, title=None):
+    """Short journal overview. ISSN first, then an exact journal-title match."""
+    source = _openalex_source_by_issn(issn) if issn else None
+    text = _description_from_source(source, issn or "") if source else ""
+    if text:
+        return text
+    if title and not clean_issn(str(title)):
+        titled = _openalex_source_by_title(title)
+        if titled and (not source or titled.get("id") != source.get("id")):
+            text = _description_from_source(titled, (titled.get("issn_l") or ""))
+            if text:
+                return text
     return "N/A"
 
 
@@ -1684,19 +1767,41 @@ def _description_already_set(row):
     return bool(text) and text.lower() not in {"nan", "n/a", "na", "none"}
 
 
+def _cell_text(raw):
+    if raw is None:
+        return ""
+    try:
+        if pd.isna(raw):
+            return ""
+    except TypeError:
+        pass
+    if isinstance(raw, (list, tuple)):
+        raw = " ".join(str(item) for item in raw)
+    return str(raw).strip()
+
+
 def _issn_for_description(row):
-    for key in ("Queried ISSN", "Query", "ISSN", "eISSN"):
-        raw = row.get(key)
-        if raw is None:
+    for key in ("Queried ISSN", "Query", "ISSN", "eISSN", "Print ISSN"):
+        text = _cell_text(row.get(key))
+        if not text or text.lower() in {"n/a", "nan", "none"}:
             continue
-        try:
-            if pd.isna(raw):
-                continue
-        except TypeError:
-            pass
-        if clean_issn(str(raw)):
-            return str(raw).strip()
+        if clean_issn(text):
+            return text
+        found = re.search(r"\b\d{4}-?\d{3}[\dXx]\b", text)
+        if found and clean_issn(found.group(0)):
+            return found.group(0)
     return None
+
+
+def _title_for_description(row):
+    for key in ("Journal Title", "Query"):
+        text = _cell_text(row.get(key))
+        if not text or text.lower() in {"n/a", "nan", "none"}:
+            continue
+        if clean_issn(text):
+            continue
+        return text
+    return ""
 
 
 def _place_brief_description(row, description):
@@ -1727,20 +1832,48 @@ def attach_brief_descriptions(rows, progress_bar, status_text, cache=None):
                 progress_bar.progress((i + 1) / total)
             continue
         issn = _issn_for_description(row)
-        label = issn or row.get("Query") or row.get("Journal Title") or ""
+        title = _title_for_description(row)
+        label = issn or title or ""
         status_text.text(f"Brief description {i + 1} of {total}: {str(label)[:40]}")
-        if not issn:
+        cache_key = clean_issn(issn) or f"title:{title.lower()}"
+        if not cache_key:
             text = "N/A"
         else:
-            key = clean_issn(issn)
-            if key not in cache:
-                cache[key] = fetch_journal_brief_description(issn)
+            if cache_key not in cache:
+                cache[cache_key] = fetch_journal_brief_description(issn, title)
                 time.sleep(0.25)
-            text = cache[key]
+            text = cache[cache_key]
         rows[i] = _place_brief_description(row, text)
         if progress_bar is not None:
             progress_bar.progress((i + 1) / total)
     return rows
+
+
+def _ensure_brief_descriptions(df, state_key):
+    """Fill N/A descriptions on results already kept in the session, once per table."""
+    if df is None or getattr(df, "empty", True):
+        return df
+    rows = df.to_dict("records")
+    if rows and all(_description_already_set(row) for row in rows):
+        return df
+    marker_src = "|".join(
+        f"{_cell_text(row.get('Journal Title'))}|{_cell_text(row.get('Queried ISSN'))}|{_cell_text(row.get('Query'))}|{_cell_text(row.get('Brief description'))}"
+        for row in rows
+    )
+    marker = state_key + "|" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()
+    done = st.session_state.setdefault("_desc_refresh_markers", set())
+    if marker in done:
+        return df
+    progress = st.progress(0)
+    status = st.empty()
+    rows = attach_brief_descriptions(rows, progress, status)
+    progress.empty()
+    status.empty()
+    updated = pd.DataFrame(rows)
+    st.session_state[state_key] = updated
+    done.add(marker)
+    st.session_state["_desc_refresh_markers"] = done
+    return updated
 
 
 def run_batched_journal_fetch(
@@ -1996,7 +2129,13 @@ _hide_uploader_limit_script = """
 })();
 </script>
 """
-if components is not None:
+# st.components.v1.html is removed after 2026-06-01; st.iframe is the replacement.
+# Older Streamlit releases only have the components helper.
+if hasattr(st, "iframe"):
+    st.iframe(_hide_uploader_limit_script, height=0)
+else:
+    import streamlit.components.v1 as components
+
     components.html(_hide_uploader_limit_script, height=0)
 
 st.sidebar.markdown("---")
@@ -2166,6 +2305,9 @@ if app_mode == "Unified citation search":
                 _render_partial_checkpoint_download(_uj_job, "scopus", "Scopus", "unified")
 
             if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
+                st.session_state["unified_wos_journal_df"] = _ensure_brief_descriptions(
+                    st.session_state["unified_wos_journal_df"], "unified_wos_journal_df"
+                )
                 st.divider()
                 st.subheader("WoS (JCR) journal metrics")
                 st.dataframe(st.session_state["unified_wos_journal_df"], width="stretch")
@@ -2177,6 +2319,9 @@ if app_mode == "Unified citation search":
                     key="unified_wos_journal_download_btn",
                 )
             if st.session_state.get("unified_scopus_journal_df") is not None and not st.session_state["unified_scopus_journal_df"].empty:
+                st.session_state["unified_scopus_journal_df"] = _ensure_brief_descriptions(
+                    st.session_state["unified_scopus_journal_df"], "unified_scopus_journal_df"
+                )
                 if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
                     st.divider()
                 st.subheader("Scopus journal metrics")
@@ -2489,6 +2634,9 @@ elif app_mode == "Web of Science":
                 )
 
             if "wos_journal_df" in st.session_state and wos_search_mode == "Journal metrics (JCR by ISSN/title)":
+                st.session_state["wos_journal_df"] = _ensure_brief_descriptions(
+                    st.session_state["wos_journal_df"], "wos_journal_df"
+                )
                 st.divider()
                 st.dataframe(st.session_state["wos_journal_df"], width="stretch")
                 excel_jcr = to_excel(st.session_state["wos_journal_df"])
@@ -2642,6 +2790,9 @@ elif app_mode == "Scopus":
                 )
 
             if "scopus_journal_df" in st.session_state:
+                st.session_state["scopus_journal_df"] = _ensure_brief_descriptions(
+                    st.session_state["scopus_journal_df"], "scopus_journal_df"
+                )
                 st.divider()
                 st.dataframe(st.session_state["scopus_journal_df"], width="stretch")
                 excel_journal = to_excel(st.session_state["scopus_journal_df"])
