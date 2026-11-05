@@ -1958,7 +1958,7 @@ def _row_query_key(row):
 _PUBLIC_UA = "AcademicDatabaseSearch/1.0 (journal brief description; local research tool)"
 _HTML_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 _DESC_MAX_WORDS = 299
-_DESC_VERSION = "5"
+_DESC_VERSION = "6"
 _public_http = None
 _GARBAGE_SENTENCE = re.compile(
     r"^(indexed in|indexing|impact factor|journal impact factor|editors?-in-?\s*chiefs?|publishing model|submission to|downloads\b|prof\.)\b|\bview all editors\b",
@@ -1966,6 +1966,12 @@ _GARBAGE_SENTENCE = re.compile(
 )
 _GARBAGE_PAGE = re.compile(
     r"\b(cookie policy|essential cookies|privacy preference|your privacy|enable javascript|access denied|just a moment|sign in to|subscribe to continue|captcha|are you a robot|403 forbidden|page not found|cookies_not_supported)\b",
+    re.I,
+)
+_CHALLENGE_TEXT = re.compile(
+    r"security verification|malicious bots|not a bot|checking your browser|"
+    r"cf-browser-verification|enable javascript and cookies|ddos protection|"
+    r"verify you are human|bot detection|attention required",
     re.I,
 )
 _SPRINGER_JOURNAL = re.compile(
@@ -2122,10 +2128,18 @@ def _normalize_prose(text):
     return " ".join(kept).strip()
 
 
+def _is_challenge_text(value):
+    """True when a publisher returned a bot check instead of a journal description."""
+    text = "" if value is None else str(value)
+    return bool(_CHALLENGE_TEXT.search(text) or _GARBAGE_PAGE.search(text))
+
+
 def _limit_description(text):
     """Return a cleaned overview under 300 words, or '' when the text is not a description."""
+    if _is_challenge_text(text):
+        return ""
     text = _normalize_prose(text)
-    if not text or _GARBAGE_PAGE.search(text):
+    if not text or _is_challenge_text(text):
         return ""
     if text.count("|") >= 2 and len(text.split()) < 25:
         return ""
@@ -2355,16 +2369,117 @@ def _first_page_description(urls):
     return ""
 
 
-def _doaj_aims_url(hyphen):
+def _doaj_journal(hyphen):
+    """DOAJ journal record. The aims-page link is kept for an archived copy, not opened live."""
+    if not hyphen:
+        return {}
     data, status = _public_get_json(f"https://doaj.org/api/search/journals/issn:{hyphen}")
     if status == 429:
         time.sleep(2)
         data, _status = _public_get_json(f"https://doaj.org/api/search/journals/issn:{hyphen}")
     results = (data or {}).get("results") if isinstance(data, dict) else None
-    if not results:
-        return ""
-    ref = ((results[0].get("bibjson") or {}).get("ref") or {})
+    if not results or not isinstance(results[0], dict):
+        return {}
+    bib = results[0].get("bibjson") or {}
+    return bib if isinstance(bib, dict) else {}
+
+
+def _doaj_prose_from_bib(bib):
+    chunks = []
+    for key in ("abstract", "description"):
+        value = (bib or {}).get(key)
+        if isinstance(value, str):
+            chunks.append(value)
+    ref = (bib or {}).get("ref") or {}
+    statement = ref.get("oa_statement") if isinstance(ref, dict) else None
+    if isinstance(statement, str) and not statement.strip().lower().startswith("http"):
+        chunks.append(statement)
+    return _best_description(chunks)
+
+
+def _doaj_aims_url(hyphen):
+    ref = (_doaj_journal(hyphen).get("ref") or {})
     return (ref.get("aims_scope") or ref.get("journal") or "").strip()
+
+
+def _nlm_catalog_prose(issn):
+    """Descriptive note from the NLM Catalog. This does not open the publisher site."""
+    cleaned = clean_issn(issn)
+    if not cleaned:
+        return ""
+    hyphen = format_issn_for_wos(cleaned)
+    data, _status = _public_get_json(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params={
+            "db": "nlmcatalog",
+            "term": f"{hyphen}[ISSN]",
+            "retmode": "json",
+            "retmax": "1",
+            "tool": "academic_database_search",
+        },
+    )
+    ids = ((data or {}).get("esearchresult") or {}).get("idlist") if isinstance(data, dict) else None
+    if not ids:
+        return ""
+    xml_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urlencode(
+        {
+            "db": "nlmcatalog",
+            "id": str(ids[0]),
+            "retmode": "xml",
+            "tool": "academic_database_search",
+        }
+    )
+    page = _public_get_html(xml_url, timeout=25)
+    if not page:
+        return ""
+    notes = []
+    for tag in ("OtherAbstract", "Abstract", "GeneralNote", "IndexingNote"):
+        notes.extend(re.findall(rf"<{tag}[^>]*>(.*?)</{tag}>", page, flags=re.I | re.S))
+    useful = []
+    for note in notes:
+        plain = re.sub(r"<[^>]+>", " ", note)
+        lowered = " ".join(plain.lower().split())
+        if lowered.startswith(("continues", "continued by", "description based on")):
+            continue
+        useful.append(plain)
+    return _best_description(useful)
+
+
+def _wayback_snapshot_url(url):
+    """Latest archived copy of a publisher page, when the live site shows a bot check."""
+    if not url or not str(url).startswith("http"):
+        return ""
+    data, _status = _public_get_json(
+        "https://archive.org/wayback/available",
+        params={"url": url},
+        timeout=15,
+    )
+    closest = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
+    if not closest.get("available"):
+        return ""
+    snapshot = closest.get("url") or ""
+    if not isinstance(snapshot, str) or "/web/" not in snapshot:
+        return ""
+    return re.sub(r"(/web/\d+)/", r"\1id_/", snapshot, count=1)
+
+
+def _archived_page_description(url):
+    snapshot = _wayback_snapshot_url(url)
+    if not snapshot:
+        return ""
+    return _harvest_page_description(snapshot)
+
+
+def _fallback_page_description(urls):
+    """Archived publisher page, then one reader-proxy attempt. Bot-check text is discarded."""
+    candidates = [url for url in _unique_urls(urls) if url and str(url).startswith("http")]
+    for url in candidates[:2]:
+        text = _archived_page_description(url)
+        if text:
+            return text
+    if candidates:
+        return _jina_description(candidates[0], timeout=10)
+    return ""
 
 
 def _wikidata_official_url(entity):
@@ -2501,20 +2616,18 @@ def _openalex_source_by_title(title):
     return None
 
 
-def _description_from_source(data, issn_for_doaj="", fast=False):
-    """Wikipedia overview, then the journal homepage, then DOAJ."""
+def _description_from_source(data, issn_for_doaj=""):
+    """Wikipedia, then DOAJ and NLM text, then an archived publisher page."""
     if not isinstance(data, dict):
         data = {}
-    homepage = (data.get("homepage_url") or "").strip()
     wikidata_url = ((data.get("ids") or {}).get("wikidata") or "").strip()
     qid = wikidata_url.rstrip("/").split("/")[-1]
-    official_site = ""
     wiki_text = ""
     if qid.startswith("Q"):
         wd_params = {
             "action": "wbgetentities",
             "ids": qid,
-            "props": "sitelinks|claims",
+            "props": "sitelinks",
             "sitefilter": "enwiki",
             "format": "json",
         }
@@ -2525,54 +2638,50 @@ def _description_from_source(data, issn_for_doaj="", fast=False):
         entity = ((wd or {}).get("entities") or {}).get(qid) or {}
         wiki_title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
         wiki_text = _wikipedia_extract(wiki_title)
-        official_site = _wikidata_official_url(entity)
 
     text = _limit_description(wiki_text)
-    if text or fast:
+    if text:
         return text
-
-    page_urls = _unique_urls([homepage, official_site])
-    harvested = _first_page_description(page_urls)
-    if harvested:
-        return harvested
 
     hyphen = format_issn_for_wos(clean_issn(issn_for_doaj) or "")
     if not hyphen and data.get("issn_l"):
         hyphen = format_issn_for_wos(clean_issn(str(data.get("issn_l"))) or "")
-    if not page_urls and hyphen:
-        harvested = _first_page_description(_catalog_page_urls(hyphen))
-        if harvested:
-            return harvested
-    if hyphen and len(clean_issn(hyphen) or "") == 8:
-        aims_url = _doaj_aims_url(hyphen)
-        harvested = _first_page_description([aims_url])
-        if harvested:
-            return harvested
-    return ""
-
-
-def fetch_journal_brief_description(issn=None, title=None, fast=True):
-    """Short journal overview. Does not require the journal to be in WoS or Scopus.
-
-    Bulk search uses the fast Wikipedia/OpenAlex summary. Publisher-page scraping
-    can take half a minute per journal, which is not practical for large lists.
-    """
-    source = _openalex_source_by_issn(issn) if issn else None
-    text = _description_from_source(source or {}, issn or "", fast=fast) if (source or issn) else ""
+    bib = _doaj_journal(hyphen) if hyphen and len(clean_issn(hyphen) or "") == 8 else {}
+    text = _doaj_prose_from_bib(bib)
     if text:
         return text
-    if not fast and not title and issn:
+    text = _nlm_catalog_prose(issn_for_doaj or data.get("issn_l") or "")
+    return text or ""
+
+
+def fetch_journal_brief_description(issn=None, title=None):
+    """Short journal overview. Does not require the journal to be in WoS or Scopus.
+
+    Wikipedia, DOAJ, or the NLM Catalog supply the description first. If those have
+    no text, an archived copy of the publisher page is tried, then a reader proxy.
+    A bot-check page is discarded rather than saved.
+    """
+    source = _openalex_source_by_issn(issn) if issn else None
+    text = _description_from_source(source or {}, issn or "") if (source or issn) else ""
+    if text:
+        return text
+    if not title and issn:
         title = _crossref_journal_title(issn)
+    homepage = (source.get("homepage_url") or "").strip() if isinstance(source, dict) else ""
     if title and not clean_issn(str(title)):
         titled = _openalex_source_by_title(title)
         if titled and (not source or titled.get("id") != source.get("id")):
-            text = _description_from_source(titled, (titled.get("issn_l") or ""), fast=fast)
+            text = _description_from_source(titled, titled.get("issn_l") or "")
             if text:
                 return text
+            homepage = homepage or (titled.get("homepage_url") or "").strip()
         text = _limit_description(_wikipedia_search_extract(title))
         if text:
             return text
-    return "N/A"
+    hyphen = format_issn_for_wos(clean_issn(issn) or "")
+    aims = _doaj_aims_url(hyphen) if hyphen else ""
+    text = _fallback_page_description([aims, homepage])
+    return text or "N/A"
 
 
 def _description_already_set(row):
@@ -2587,6 +2696,8 @@ def _description_already_set(row):
     except TypeError:
         pass
     text = str(val).strip()
+    if _is_challenge_text(text):
+        return False
     return bool(text) and text.lower() not in {"nan", "n/a", "na", "none"}
 
 
@@ -2644,6 +2755,8 @@ def _title_for_description(row):
 
 def _description_needs_attempt(row, cache):
     """Whether a row needs its first description lookup or a retry with a new title."""
+    if _is_challenge_text(row.get("Brief description")):
+        return True
     if not _description_column_set(row):
         return True
     if _description_already_set(row):
@@ -2657,6 +2770,8 @@ def _description_needs_attempt(row, cache):
 
 
 def _place_brief_description(row, description):
+    if _is_challenge_text(description):
+        description = "N/A"
     description = description or "N/A"
     items = [(k, v) for k, v in row.items() if k != "Brief description"]
     keys = [k for k, _ in items]
@@ -2717,6 +2832,8 @@ def attach_brief_descriptions(
         tried_key = f"tried:{cache_key}"
         title_key = (title or "").lower()
         cached = cache.get(cache_key)
+        if _is_challenge_text(cached):
+            cached = None
         if not cache_key or cached not in (None, "N/A") or (cached == "N/A" and cache.get(tried_key) == title_key):
             text = "N/A" if not cache_key or cached in (None, "N/A") else cached
             rows[i] = _place_brief_description(row, text)
@@ -2748,7 +2865,7 @@ def attach_brief_descriptions(
     def _lookup(job):
         cache_key, issn, title, title_key = job
         pacer.wait()
-        text = fetch_journal_brief_description(issn, title, fast=True)
+        text = fetch_journal_brief_description(issn, title)
         return cache_key, title_key, text
 
     def _store(_index, result):
@@ -3180,24 +3297,78 @@ def _render_partial_checkpoint_download(
         return
     if not include_descriptions and "Brief description" in df.columns:
         df = df.drop(columns=["Brief description"])
-    done = meta.get(f"{platform}_done", len(df))
-    total = meta.get(f"{platform}_total", len(df))
+    df = _without_challenge_text(df)
+    done = int(meta.get(f"{platform}_done", len(df)) or 0)
+    total = int(meta.get(f"{platform}_total", len(df)) or 0)
+    complete = bool(total) and done >= total
     st.caption(
-        f"💾 **{label}:** {len(df)} rows auto-saved "
-        f"({done}/{total} processed). File: `{path.name}`"
+        f"💾 **{label}:** {len(df):,} rows saved"
+        + (f" ({done:,}/{total:,} processed)." if total else ".")
+        + (" Ready to download." if complete else " You can download the saved rows while the search continues.")
     )
-    st.download_button(
-        label=f"📥 Download partial {label} (.xlsx)",
-        data=to_excel(df),
-        file_name=f"{platform}_partial_{job_id[:12]}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"partial_dl_{platform}_{key_suffix}",
-    )
+    _render_journal_export_buttons(df, f"{platform}_journal_results_{job_id[:12]}", f"partial_dl_{platform}_{key_suffix}")
 
 
 # ==========================================
 # EXCEL GENERATOR (In-Memory)
 # ==========================================
+def _without_challenge_text(df):
+    """Replace saved bot-check pages so they are not shown or downloaded as descriptions."""
+    if df is None or "Brief description" not in getattr(df, "columns", []):
+        return df
+    cleaned = df.copy()
+    cleaned["Brief description"] = [
+        "N/A" if _is_challenge_text(value) else value
+        for value in cleaned["Brief description"]
+    ]
+    return cleaned
+
+
+def _render_journal_export_buttons(df, stem, key_prefix):
+    """Offer metrics, descriptions, and the combined workbook separately."""
+    if df is None or getattr(df, "empty", True):
+        return
+    working = _without_challenge_text(df)
+    metrics = working.drop(columns=["Brief description"], errors="ignore")
+    has_descriptions = "Brief description" in working.columns
+    columns = st.columns(3 if has_descriptions else 1)
+    with columns[0]:
+        st.download_button(
+            label="📥 Journal metrics",
+            data=to_excel(metrics),
+            file_name=f"{stem}_metrics.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_metrics",
+            use_container_width=True,
+        )
+    if not has_descriptions:
+        return
+    identity = [
+        column for column in (
+            "Journal Title", "Query", "Queried ISSN", "ISSN", "Print ISSN", "eISSN", "Publisher",
+        )
+        if column in working.columns
+    ]
+    with columns[1]:
+        st.download_button(
+            label="📥 Journal descriptions",
+            data=to_excel(working.loc[:, identity + ["Brief description"]]),
+            file_name=f"{stem}_descriptions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_descriptions",
+            use_container_width=True,
+        )
+    with columns[2]:
+        st.download_button(
+            label="📥 Metrics and descriptions",
+            data=to_excel(working),
+            file_name=f"{stem}_metrics_and_descriptions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_both",
+            use_container_width=True,
+        )
+
+
 def to_excel(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -3426,7 +3597,7 @@ if app_mode == "Unified citation search":
                 "Include journal descriptions (slower)",
                 value=True,
                 key="unified_include_descriptions",
-                help="Turn this off when you only need WoS and Scopus metrics. Descriptions are short Wikipedia summaries, without slow publisher-page lookups.",
+                help="Turn this off when you only need WoS and Scopus metrics. Descriptions use Wikipedia, DOAJ, NLM, or an archived publisher page. Bot-check pages are skipped.",
             )
 
             st.caption(
@@ -3495,6 +3666,20 @@ if app_mode == "Unified citation search":
                     )
                 )
                 st.session_state["unified_journal_job_id"] = job_id
+                _render_partial_checkpoint_download(
+                    job_id,
+                    "wos",
+                    "WoS (JCR)",
+                    "unified",
+                    include_descriptions=unified_include_descriptions,
+                )
+                _render_partial_checkpoint_download(
+                    job_id,
+                    "scopus",
+                    "Scopus",
+                    "unified",
+                    include_descriptions=unified_include_descriptions,
+                )
                 wos_queries = [format_issn_for_wos(issn) for issn in clean_issns]
                 initial_meta = _load_checkpoint_meta(job_id)
                 initial_meta.update({
@@ -3610,20 +3795,11 @@ if app_mode == "Unified citation search":
                         not _description_needs_attempt(row, desc_cache)
                         for row in scopus_journal_data
                     )
-                    final_completed = core_total
-                    if WOS_JOURNAL_API_KEY:
-                        final_completed += wos_final_done
-                        if wos_final_done >= len(wos_journal_rows) and _scopus_ok:
-                            final_completed += scopus_final_done
-                    elif _scopus_ok:
-                        final_completed += scopus_final_done
-                    _render_job_progress(
-                        progress_bar,
-                        final_completed,
-                        overall_total,
-                        final_elapsed_base,
-                        "Final description checks",
-                    )
+                    if wos_final_done < len(wos_journal_rows) or scopus_final_done < len(scopus_journal_data):
+                        progress_bar.progress(
+                            0.99,
+                            text="Preparing download. Finishing remaining journal descriptions…",
+                        )
                 if (
                     unified_include_descriptions
                     and wos_journal_rows
@@ -3674,13 +3850,7 @@ if app_mode == "Unified citation search":
                     )
                 final_elapsed = final_elapsed_base + (time.time() - final_started)
                 if unified_include_descriptions:
-                    _render_job_progress(
-                        progress_bar,
-                        overall_total,
-                        overall_total,
-                        final_elapsed,
-                        "All journal metrics",
-                    )
+                    progress_bar.progress(1.0, text="All journal metrics: ready to download")
                 else:
                     for row in wos_journal_rows + scopus_journal_data:
                         row.pop("Brief description", None)
@@ -3694,54 +3864,51 @@ if app_mode == "Unified citation search":
                 _save_checkpoint_meta(job_id, final_meta)
                 st.session_state["unified_journal_autorun"] = False
 
-            _uj_job = st.session_state.get("unified_journal_job_id")
-            if _uj_job:
-                _render_partial_checkpoint_download(
-                    _uj_job,
-                    "wos",
-                    "WoS (JCR)",
-                    "unified",
-                    include_descriptions=unified_include_descriptions,
-                )
-                _render_partial_checkpoint_download(
-                    _uj_job,
-                    "scopus",
-                    "Scopus",
-                    "unified",
-                    include_descriptions=unified_include_descriptions,
-                )
+            if not _unified_run_now:
+                _uj_job = st.session_state.get("unified_journal_job_id")
+                if _uj_job:
+                    _render_partial_checkpoint_download(
+                        _uj_job,
+                        "wos",
+                        "WoS (JCR)",
+                        "unified",
+                        include_descriptions=unified_include_descriptions,
+                    )
+                    _render_partial_checkpoint_download(
+                        _uj_job,
+                        "scopus",
+                        "Scopus",
+                        "unified",
+                        include_descriptions=unified_include_descriptions,
+                    )
 
             if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
+                st.divider()
+                st.subheader("WoS (JCR) journal metrics")
+                st.dataframe(_without_challenge_text(st.session_state["unified_wos_journal_df"]), width="stretch")
+                _render_journal_export_buttons(
+                    st.session_state["unified_wos_journal_df"],
+                    "unified_wos_journal_results",
+                    "unified_wos_journal_download_btn",
+                )
                 if unified_include_descriptions:
                     st.session_state["unified_wos_journal_df"] = _ensure_brief_descriptions(
                         st.session_state["unified_wos_journal_df"], "unified_wos_journal_df"
                     )
-                st.divider()
-                st.subheader("WoS (JCR) journal metrics")
-                st.dataframe(st.session_state["unified_wos_journal_df"], width="stretch")
-                st.download_button(
-                    label="📥 Download WoS journal metrics (.xlsx)",
-                    data=to_excel(st.session_state["unified_wos_journal_df"]),
-                    file_name="unified_wos_journal_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="unified_wos_journal_download_btn",
-                )
             if st.session_state.get("unified_scopus_journal_df") is not None and not st.session_state["unified_scopus_journal_df"].empty:
+                if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
+                    st.divider()
+                st.subheader("Scopus journal metrics")
+                st.dataframe(_without_challenge_text(st.session_state["unified_scopus_journal_df"]), width="stretch")
+                _render_journal_export_buttons(
+                    st.session_state["unified_scopus_journal_df"],
+                    "unified_scopus_journal_results",
+                    "unified_scopus_journal_download_btn",
+                )
                 if unified_include_descriptions:
                     st.session_state["unified_scopus_journal_df"] = _ensure_brief_descriptions(
                         st.session_state["unified_scopus_journal_df"], "unified_scopus_journal_df"
                     )
-                if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
-                    st.divider()
-                st.subheader("Scopus journal metrics")
-                st.dataframe(st.session_state["unified_scopus_journal_df"], width="stretch")
-                st.download_button(
-                    label="📥 Download Scopus journal metrics (.xlsx)",
-                    data=to_excel(st.session_state["unified_scopus_journal_df"]),
-                    file_name="unified_scopus_journal_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="unified_scopus_journal_download_btn",
-                )
     else:
         raw_input = st.text_area(
             "📋 Paste DOIs (one per line)",
@@ -3981,7 +4148,7 @@ elif app_mode == "Web of Science":
                 "Include journal descriptions (slower)",
                 value=True,
                 key="wos_include_descriptions",
-                help="Turn this off for a faster metrics-only result. Descriptions are short Wikipedia summaries.",
+                help="Turn this off for a faster metrics-only result. Descriptions use Wikipedia, DOAJ, NLM, or an archived page when the live publisher site shows a bot check.",
             )
 
             st.caption(
@@ -4045,6 +4212,13 @@ elif app_mode == "Web of Science":
                     include_descriptions=wos_include_descriptions,
                 )
                 st.session_state["wos_journal_job_id"] = job_id
+                _render_partial_checkpoint_download(
+                    job_id,
+                    "wos",
+                    "WoS (JCR)",
+                    "wos_only",
+                    include_descriptions=wos_include_descriptions,
+                )
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 if _job_has_more(job_id, "wos", len(_wos_queries)):
@@ -4089,7 +4263,7 @@ elif app_mode == "Web of Science":
                 st.session_state["wos_journal_df"] = pd.DataFrame(journal_rows)
                 st.session_state["wos_journal_autorun"] = False
 
-            if st.session_state.get("wos_journal_job_id"):
+            if not _wos_run_now and st.session_state.get("wos_journal_job_id"):
                 _render_partial_checkpoint_download(
                     st.session_state["wos_journal_job_id"],
                     "wos",
@@ -4099,20 +4273,17 @@ elif app_mode == "Web of Science":
                 )
 
             if "wos_journal_df" in st.session_state and wos_search_mode == "Journal metrics (JCR by ISSN/title)":
+                st.divider()
+                st.dataframe(_without_challenge_text(st.session_state["wos_journal_df"]), width="stretch")
+                _render_journal_export_buttons(
+                    st.session_state["wos_journal_df"],
+                    "wos_journal_results",
+                    "wos_journal_download_btn",
+                )
                 if wos_include_descriptions:
                     st.session_state["wos_journal_df"] = _ensure_brief_descriptions(
                         st.session_state["wos_journal_df"], "wos_journal_df"
                     )
-                st.divider()
-                st.dataframe(st.session_state["wos_journal_df"], width="stretch")
-                excel_jcr = to_excel(st.session_state["wos_journal_df"])
-                st.download_button(
-                    label="📥 Download journal metrics (.xlsx)",
-                    data=excel_jcr,
-                    file_name="wos_journal_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="wos_journal_download_btn",
-                )
 
 elif app_mode == "Scopus":
     _title_with_icon("Scopus.png", "Scopus Citation Finder")
@@ -4200,7 +4371,7 @@ elif app_mode == "Scopus":
                 "Include journal descriptions (slower)",
                 value=True,
                 key="scopus_include_descriptions",
-                help="Turn this off for a faster metrics-only result. Descriptions are short Wikipedia summaries.",
+                help="Turn this off for a faster metrics-only result. Descriptions use Wikipedia, DOAJ, NLM, or an archived page when the live publisher site shows a bot check.",
             )
 
             st.caption(
@@ -4256,6 +4427,13 @@ elif app_mode == "Scopus":
                     include_descriptions=scopus_include_descriptions,
                 )
                 st.session_state["scopus_journal_job_id"] = job_id
+                _render_partial_checkpoint_download(
+                    job_id,
+                    "scopus",
+                    "Scopus",
+                    "scopus_only",
+                    include_descriptions=scopus_include_descriptions,
+                )
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 if _job_has_more(job_id, "scopus", len(_scopus_clean)):
@@ -4300,7 +4478,7 @@ elif app_mode == "Scopus":
                 st.session_state["scopus_journal_df"] = pd.DataFrame(journal_data)
                 st.session_state["scopus_journal_autorun"] = False
 
-            if st.session_state.get("scopus_journal_job_id"):
+            if not _scopus_run_now and st.session_state.get("scopus_journal_job_id"):
                 _render_partial_checkpoint_download(
                     st.session_state["scopus_journal_job_id"],
                     "scopus",
@@ -4310,20 +4488,17 @@ elif app_mode == "Scopus":
                 )
 
             if "scopus_journal_df" in st.session_state:
+                st.divider()
+                st.dataframe(_without_challenge_text(st.session_state["scopus_journal_df"]), width="stretch")
+                _render_journal_export_buttons(
+                    st.session_state["scopus_journal_df"],
+                    "scopus_journal_results",
+                    "scopus_journal_download_btn",
+                )
                 if scopus_include_descriptions:
                     st.session_state["scopus_journal_df"] = _ensure_brief_descriptions(
                         st.session_state["scopus_journal_df"], "scopus_journal_df"
                     )
-                st.divider()
-                st.dataframe(st.session_state["scopus_journal_df"], width="stretch")
-                excel_journal = to_excel(st.session_state["scopus_journal_df"])
-                st.download_button(
-                    label="📥 Download journal metrics (.xlsx)",
-                    data=excel_journal,
-                    file_name="scopus_journal_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="scopus_journal_download_btn",
-                )
 
 elif app_mode == "Google Scholar":
     _title_with_icon("Google.png", "Google Scholar Citation Finder")
