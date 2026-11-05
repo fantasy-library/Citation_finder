@@ -11,11 +11,16 @@ import secrets
 import shutil
 import ssl
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote, unquote, urlencode
 
-# Keep each automatic run short enough to checkpoint frequently on hosted Streamlit.
-JOURNAL_BATCH_SIZE = 10
+# Checkpoint often enough to resume, while keeping each automatic run reasonably long.
+JOURNAL_BATCH_SIZE = 40
+JOURNAL_FETCH_WORKERS = 6
+# Descriptions are much quicker than metric calls, so they get a small slice of the bar.
+_DESCRIPTION_PROGRESS_SHARE = 0.15
 
 try:
     from serpapi import GoogleSearch as SerpApiGoogleSearch
@@ -460,6 +465,83 @@ def fetch_wos_data(wos_ids, progress_bar, status_text, wos_api_key=None):
 WOS_JOURNALS_BASE = "https://api.clarivate.com/apis/wos-journals/v1"
 
 
+class _RequestPacer:
+    """Space out request starts, and slow down automatically when an API returns 429."""
+
+    def __init__(self, min_interval, max_interval=1.0):
+        self.min_interval = min_interval
+        self.max_interval = max_interval
+        self._interval = min_interval
+        self._next = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            delay = self._next - now
+            self._next = max(now, self._next) + self._interval
+        if delay > 0:
+            time.sleep(delay)
+
+    def slow_down(self):
+        with self._lock:
+            self._interval = min(self.max_interval, max(self.min_interval, self._interval * 1.6))
+            self._next = max(self._next, time.monotonic() + self._interval)
+
+    def speed_up(self):
+        with self._lock:
+            self._interval = max(self.min_interval, self._interval * 0.97)
+
+
+def _map_in_order(items, worker, max_workers, on_done=None):
+    """Run worker across items and return results in input order."""
+    if not items:
+        return []
+    workers = max(1, min(int(max_workers or 1), len(items)))
+    if workers == 1:
+        results = []
+        for index, item in enumerate(items):
+            result = worker(item)
+            results.append(result)
+            if on_done:
+                on_done(index, result)
+        return results
+    results = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(worker, item): index for index, item in enumerate(items)}
+        for future in as_completed(futures):
+            index = futures[future]
+            results[index] = future.result()
+            if on_done:
+                on_done(index, results[index])
+    return results
+
+
+def _paced_get(pacer, url, retries=3, **kwargs):
+    """GET with shared pacing and a few retries after rate limits or connection errors."""
+    kwargs.setdefault("timeout", 20)
+    last_error = None
+    for attempt in range(retries):
+        pacer.wait()
+        try:
+            response = requests.get(url, **kwargs)
+        except requests.RequestException as exc:
+            last_error = exc
+            pacer.slow_down()
+            time.sleep(min(4, 0.5 * (2 ** attempt)))
+            continue
+        if response.status_code == 429 and attempt < retries - 1:
+            pacer.slow_down()
+            time.sleep(min(6, 0.8 * (2 ** attempt)))
+            continue
+        if response.status_code < 400:
+            pacer.speed_up()
+        return response
+    if last_error:
+        raise last_error
+    return response
+
+
 def _parse_wos_journal_entry(entry, query):
     """Parse one journal from WOS Journals API response (JournalListRecord or full journal) into a flat row."""
     if not isinstance(entry, dict):
@@ -674,20 +756,41 @@ def resolve_latest_jcr_year(api_key):
     return resolved
 
 
+def _merge_wos_entry(enriched, incoming, preserve_identity=False):
+    if not isinstance(incoming, dict):
+        return
+    for key, value in incoming.items():
+        if preserve_identity and key in ("id", "name") and key in enriched:
+            continue
+        if isinstance(enriched.get(key), dict) and isinstance(value, dict):
+            enriched[key] = {**enriched[key], **value}
+        elif preserve_identity or key not in enriched:
+            enriched[key] = value
+
+
 def fetch_wos_journal_data(
     queries, api_key, jcr_year, edition_filter, progress_bar, status_text, include_metrics_filters=True
 ):
     """Fetch JCR journal metrics by search query (ISSN or title). Uses WOS Journals API."""
-    results = []
     total = len(queries)
+    if not total:
+        return []
     headers = {"X-ApiKey": api_key}
+    pacer = _RequestPacer(0.12)
+    status_text.text(f"Fetching {total} Web of Science journals, {JOURNAL_FETCH_WORKERS} at a time...")
+    completed = 0
+    progress_lock = threading.Lock()
 
-    for i, q in enumerate(queries):
+    def _finish(_index, _row):
+        nonlocal completed
+        with progress_lock:
+            completed += 1
+            progress_bar.progress(completed / total)
+
+    def _one(q):
         q = (q or "").strip()
         if not q:
-            progress_bar.progress((i + 1) / total)
-            continue
-        status_text.text(f"Fetching journal {i+1} of {total}: {q[:50]}...")
+            return {"Query": q, "Status": "No journal found"}
         url = f"{WOS_JOURNALS_BASE}/journals"
         # API expects camelCase only (jcrYear, not jcr_year); snake_case params cause 400 Bad Request
         params = {"q": q, "limit": 50, "page": 1}
@@ -704,10 +807,9 @@ def fetch_wos_journal_data(
                 params["jci"] = "gte:0"
                 params["jciPercentile"] = "gte:0 AND lte:100"
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = _paced_get(pacer, url, headers=headers, params=params)
             if response.status_code == 200:
                 data = response.json()
-                # WOS Journals API returns list in "hits" (JournalList schema)
                 journal_list = (
                     data.get("hits")
                     or data.get("journalList")
@@ -718,107 +820,54 @@ def fetch_wos_journal_data(
                 if isinstance(journal_list, dict):
                     journal_list = journal_list.get("journal") or journal_list.get("journals") or journal_list.get("hits") or []
                 if not journal_list:
-                    results.append({"Query": q, "Status": "No journal found"})
-                else:
-                    first = journal_list[0] if isinstance(journal_list[0], dict) else None
-                    if first:
-                        # Enrich with journal detail and report data to fill ISSN, publisher, categories, ranks, etc.
-                        enriched = dict(first)
-                        if jcr_year:
-                            try:
-                                enriched["_jcr_year"] = int(jcr_year)
-                            except Exception:
-                                enriched["_jcr_year"] = str(jcr_year)
-                        journal_id = first.get("id")
-
-                        if journal_id:
-                            # Detail endpoint: /journals/{id}
-                            try:
-                                detail_resp = requests.get(
-                                    f"{WOS_JOURNALS_BASE}/journals/{journal_id}",
-                                    headers=headers,
-                                    timeout=30,
+                    return {"Query": q, "Status": "No journal found"}
+                first = journal_list[0] if isinstance(journal_list[0], dict) else None
+                if not first:
+                    return {"Query": q, "Status": "No journal data"}
+                enriched = dict(first)
+                if jcr_year:
+                    try:
+                        enriched["_jcr_year"] = int(jcr_year)
+                    except Exception:
+                        enriched["_jcr_year"] = str(jcr_year)
+                journal_id = first.get("id")
+                if journal_id:
+                    try:
+                        detail_resp = _paced_get(
+                            pacer,
+                            f"{WOS_JOURNALS_BASE}/journals/{journal_id}",
+                            headers=headers,
+                        )
+                        if detail_resp.status_code == 200:
+                            d_json = detail_resp.json()
+                            detail_entry = d_json.get("journal") or d_json.get("data") or d_json
+                            _merge_wos_entry(enriched, detail_entry, preserve_identity=True)
+                    except Exception:
+                        pass
+                    if jcr_year:
+                        try:
+                            report_resp = _paced_get(
+                                pacer,
+                                f"{WOS_JOURNALS_BASE}/journals/{journal_id}/reports/year/{int(jcr_year)}",
+                                headers=headers,
+                            )
+                            if report_resp.status_code == 200:
+                                r_json = report_resp.json()
+                                report_entry = (
+                                    r_json.get("journal")
+                                    or r_json.get("reports")
+                                    or r_json.get("data")
+                                    or r_json
                                 )
-                                if detail_resp.status_code == 200:
-                                    d_json = detail_resp.json()
-                                    detail_entry = (
-                                        d_json.get("journal")
-                                        or d_json.get("data")
-                                        or d_json
-                                    )
-                                    if isinstance(detail_entry, dict):
-                                        for k, v in detail_entry.items():
-                                            # Preserve id and name from the list hit
-                                            if k in ("id", "name") and k in enriched:
-                                                continue
-                                            if (
-                                                k in enriched
-                                                and isinstance(enriched[k], dict)
-                                                and isinstance(v, dict)
-                                            ):
-                                                merged = {**enriched[k], **v}
-                                                enriched[k] = merged
-                                            else:
-                                                enriched[k] = v
-                                elif detail_resp.status_code == 429:
-                                    # Back off briefly on per-id detail rate limiting
-                                    time.sleep(2)
-                            except Exception:
-                                # Best-effort enrichment; keep base hit if detail fails
-                                pass
+                                _merge_wos_entry(enriched, report_entry, preserve_identity=False)
+                        except Exception:
+                            pass
+                return _parse_wos_journal_entry(enriched, q)
+            return {"Query": q, "Status": api_error_message("WOS", response.status_code, getattr(response, "text", None))}
+        except Exception as exc:
+            return {"Query": q, "Status": f"Error: {str(exc)[:60]}"}
 
-                            # Year-specific report endpoint: /journals/{id}/reports/year/{year}
-                            if jcr_year:
-                                try:
-                                    year_int = int(jcr_year)
-                                    report_resp = requests.get(
-                                        f"{WOS_JOURNALS_BASE}/journals/{journal_id}/reports/year/{year_int}",
-                                        headers=headers,
-                                        timeout=30,
-                                    )
-                                    if report_resp.status_code == 200:
-                                        r_json = report_resp.json()
-                                        report_entry = (
-                                            r_json.get("journal")
-                                            or r_json.get("reports")
-                                            or r_json.get("data")
-                                            or r_json
-                                        )
-                                        if isinstance(report_entry, dict):
-                                            for k, v in report_entry.items():
-                                                if (
-                                                    k in enriched
-                                                    and isinstance(enriched[k], dict)
-                                                    and isinstance(v, dict)
-                                                ):
-                                                    merged = {**enriched[k], **v}
-                                                    enriched[k] = merged
-                                                elif k not in enriched:
-                                                    enriched[k] = v
-                                    elif report_resp.status_code == 429:
-                                        time.sleep(2)
-                                except Exception:
-                                    # If report call fails, we still have list + detail data
-                                    pass
-
-                        results.append(_parse_wos_journal_entry(enriched, q))
-                    else:
-                        results.append({"Query": q, "Status": "No journal data"})
-            elif response.status_code == 429:
-                status_text.text(f"Rate limit at {q[:30]}. Sleeping 2s...")
-                time.sleep(2)
-                results.append({"Query": q, "Status": api_error_message("WOS", 429)})
-            else:
-                msg = api_error_message("WOS", response.status_code, getattr(response, "text", None))
-                results.append({"Query": q, "Status": msg})
-        except Exception as e:
-            results.append({"Query": q, "Status": f"Error: {str(e)[:60]}"})
-
-        progress_bar.progress((i + 1) / total)
-        # Sleep a bit longer here to account for the extra detail/report calls per journal
-        time.sleep(0.6)
-
-    return results
+    return _map_in_order(queries, _one, JOURNAL_FETCH_WORKERS, _finish)
 
 
 def _journal_misses(results):
@@ -1064,12 +1113,22 @@ def _extract_citescore_best_quartile(entry, target_year=None):
 def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_text, citescore_year=None):
     """Fetch journal metadata and metrics (CiteScore, SNIP, SJR, etc.) by ISSN.
     citescore_year: optional year (e.g. 2023) to request that year's data; None = latest."""
-    results = []
     total = len(issns)
+    if not total:
+        return []
     base_url = "https://api.elsevier.com/content/serial/title/issn"
+    pacer = _RequestPacer(0.12)
+    status_text.text(f"Fetching {total} Scopus journals, {JOURNAL_FETCH_WORKERS} at a time...")
+    completed = 0
+    progress_lock = threading.Lock()
 
-    for i, issn in enumerate(issns):
-        status_text.text(f"Fetching ISSN {i+1} of {total}: {issn}...")
+    def _finish(_index, _row):
+        nonlocal completed
+        with progress_lock:
+            completed += 1
+            progress_bar.progress(completed / total)
+
+    def _one(issn):
         # ENHANCED includes citeScoreCurrentMetric, which Scopus defines as the latest complete year.
         # A typed year asks for that year. A blank year omits date so the current metric moves forward
         # when Scopus publishes the next annual CiteScore.
@@ -1078,17 +1137,14 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
             url += f"&date={citescore_year}"
 
         try:
-            response = requests.get(url, timeout=30)
+            response = _paced_get(pacer, url)
             if response.status_code == 200:
                 data = response.json()
                 try:
                     resp = data.get("serial-metadata-response", {})
                     entries = resp.get("entry") or []
                     if not entries:
-                        results.append({"Queried ISSN": issn, "Status": "No journal data found"})
-                        progress_bar.progress((i + 1) / total)
-                        time.sleep(0.6)
-                        continue
+                        return {"Queried ISSN": issn, "Status": "No journal data found"}
                     entry = entries[0] if isinstance(entries, list) else entries
 
                     # Subject areas
@@ -1143,21 +1199,16 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                     rank_note = ""
                     if cite_score != "N/A":
                         try:
-                            cs_response = None
-                            for rank_attempt in range(2):
-                                cs_response = requests.get(
-                                    f"{base_url}/{issn}",
-                                    params={
-                                        "apiKey": api_key,
-                                        "insttoken": inst_token,
-                                        "httpAccept": "application/json",
-                                        "view": "CITESCORE",
-                                    },
-                                    timeout=30,
-                                )
-                                if cs_response.status_code != 429 or rank_attempt:
-                                    break
-                                time.sleep(2)
+                            cs_response = _paced_get(
+                                pacer,
+                                f"{base_url}/{issn}",
+                                params={
+                                    "apiKey": api_key,
+                                    "insttoken": inst_token,
+                                    "httpAccept": "application/json",
+                                    "view": "CITESCORE",
+                                },
+                            )
                             if cs_response is not None and cs_response.status_code == 200:
                                 cs_entries = (
                                     cs_response.json()
@@ -1177,7 +1228,7 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
 
                     snip_label = f"SNIP ({snip_year})" if str(snip_year).isdigit() else "SNIP"
                     sjr_label = f"SJR ({sjr_year})" if str(sjr_year).isdigit() else "SJR"
-                    results.append({
+                    return {
                         "Journal Title": entry.get("dc:title", "N/A"),
                         "Publisher": entry.get("dc:publisher", "N/A"),
                         "Print ISSN": entry.get("prism:issn", "N/A"),
@@ -1192,23 +1243,14 @@ def fetch_scopus_journal_data(issns, api_key, inst_token, progress_bar, status_t
                         "Aggregation Type": entry.get("prism:aggregationType", "N/A"),
                         "Queried ISSN": issn,
                         "Status": f"Success{rank_note}",
-                    })
+                    }
                 except (KeyError, IndexError, TypeError) as e:
-                    results.append({"Queried ISSN": issn, "Status": f"No journal data found ({str(e)[:40]})"})
-            elif response.status_code == 429:
-                status_text.text(f"Rate limit hit at {issn}. Sleeping 3s...")
-                time.sleep(3)
-                results.append({"Queried ISSN": issn, "Status": api_error_message("Scopus", 429)})
-            else:
-                msg = api_error_message("Scopus", response.status_code, getattr(response, "text", None))
-                results.append({"Queried ISSN": issn, "Status": msg})
+                    return {"Queried ISSN": issn, "Status": f"No journal data found ({str(e)[:40]})"}
+            return {"Queried ISSN": issn, "Status": api_error_message("Scopus", response.status_code, getattr(response, "text", None))}
         except Exception as e:
-            results.append({"Queried ISSN": issn, "Status": f"Error: {str(e)[:60]}"})
+            return {"Queried ISSN": issn, "Status": f"Error: {str(e)[:60]}"}
 
-        progress_bar.progress((i + 1) / total)
-        time.sleep(0.6)
-
-    return results
+    return _map_in_order(issns, _one, JOURNAL_FETCH_WORKERS, _finish)
 
 # ==========================================
 # GOOGLE SCHOLAR (SerpAPI) – full result or citation only
@@ -2459,7 +2501,7 @@ def _openalex_source_by_title(title):
     return None
 
 
-def _description_from_source(data, issn_for_doaj=""):
+def _description_from_source(data, issn_for_doaj="", fast=False):
     """Wikipedia overview, then the journal homepage, then DOAJ."""
     if not isinstance(data, dict):
         data = {}
@@ -2486,7 +2528,7 @@ def _description_from_source(data, issn_for_doaj=""):
         official_site = _wikidata_official_url(entity)
 
     text = _limit_description(wiki_text)
-    if text:
+    if text or fast:
         return text
 
     page_urls = _unique_urls([homepage, official_site])
@@ -2509,18 +2551,22 @@ def _description_from_source(data, issn_for_doaj=""):
     return ""
 
 
-def fetch_journal_brief_description(issn=None, title=None):
-    """Short journal overview. Does not require the journal to be in WoS or Scopus."""
+def fetch_journal_brief_description(issn=None, title=None, fast=True):
+    """Short journal overview. Does not require the journal to be in WoS or Scopus.
+
+    Bulk search uses the fast Wikipedia/OpenAlex summary. Publisher-page scraping
+    can take half a minute per journal, which is not practical for large lists.
+    """
     source = _openalex_source_by_issn(issn) if issn else None
-    text = _description_from_source(source or {}, issn or "") if (source or issn) else ""
+    text = _description_from_source(source or {}, issn or "", fast=fast) if (source or issn) else ""
     if text:
         return text
-    if not title and issn:
+    if not fast and not title and issn:
         title = _crossref_journal_title(issn)
     if title and not clean_issn(str(title)):
         titled = _openalex_source_by_title(title)
         if titled and (not source or titled.get("id") != source.get("id")):
-            text = _description_from_source(titled, (titled.get("issn_l") or ""))
+            text = _description_from_source(titled, (titled.get("issn_l") or ""), fast=fast)
             if text:
                 return text
         text = _limit_description(_wikipedia_search_extract(title))
@@ -2651,47 +2697,85 @@ def attach_brief_descriptions(
     start = max(0, only_from)
     end = len(rows) if only_to is None else min(len(rows), only_to)
     total = max(1, end - start)
-    new_since_save = 0
     changed = False
-    for n, i in enumerate(range(start, end)):
+    ready = 0
+    pending = []
+    seen_keys = set()
+    for i in range(start, end):
         row = rows[i]
         if not _description_needs_attempt(row, cache):
             rows[i] = _place_brief_description(
                 row, str(row.get("Brief description") or "N/A").strip()
             )
+            ready += 1
             if progress_bar is not None:
-                progress_bar.progress((n + 1) / total)
+                progress_bar.progress(ready / total)
             continue
         issn = _issn_for_description(row)
         title = _title_for_description(row)
-        label = issn or title or ""
-        status_text.text(f"Brief description {n + 1} of {total}: {str(label)[:40]}")
         cache_key = clean_issn(issn) or f"title:{title.lower()}"
         tried_key = f"tried:{cache_key}"
         title_key = (title or "").lower()
-        if not cache_key:
-            text = "N/A"
-        elif cache.get(cache_key) not in (None, "N/A"):
-            text = cache[cache_key]
-        elif cache.get(cache_key) == "N/A" and cache.get(tried_key) == title_key:
-            text = "N/A"
-        else:
-            # A miss with no title must not block a later row that has the journal name.
-            cache[cache_key] = fetch_journal_brief_description(issn, title)
-            cache[tried_key] = title_key
-            text = cache[cache_key]
-            time.sleep(0.25)
-        rows[i] = _place_brief_description(row, text)
-        changed = True
-        new_since_save += 1
-        if job_id and platform and new_since_save >= save_every:
+        cached = cache.get(cache_key)
+        if not cache_key or cached not in (None, "N/A") or (cached == "N/A" and cache.get(tried_key) == title_key):
+            text = "N/A" if not cache_key or cached in (None, "N/A") else cached
+            rows[i] = _place_brief_description(row, text)
+            changed = True
+            ready += 1
+            if progress_bar is not None:
+                progress_bar.progress(ready / total)
+            continue
+        if cache_key not in seen_keys:
+            pending.append((cache_key, issn, title, title_key))
+            seen_keys.add(cache_key)
+    if pending:
+        status_text.text(
+            f"Journal descriptions: {len(pending)} lookups, {JOURNAL_FETCH_WORKERS} at a time..."
+        )
+    pacer = _RequestPacer(0.08)
+    save_lock = threading.Lock()
+    new_since_save = 0
+
+    def _save_progress():
+        if job_id and platform:
             _save_partial_rows(job_id, platform, rows)
             _save_desc_cache(job_id, cache)
-            if checkpoint_callback:
-                checkpoint_callback()
-            new_since_save = 0
-        if progress_bar is not None:
-            progress_bar.progress((n + 1) / total)
+        elif job_id:
+            _save_desc_cache(job_id, cache)
+        if checkpoint_callback:
+            checkpoint_callback()
+
+    def _lookup(job):
+        cache_key, issn, title, title_key = job
+        pacer.wait()
+        text = fetch_journal_brief_description(issn, title, fast=True)
+        return cache_key, title_key, text
+
+    def _store(_index, result):
+        nonlocal ready, changed, new_since_save
+        cache_key, title_key, text = result
+        with save_lock:
+            cache[cache_key] = text
+            cache[f"tried:{cache_key}"] = title_key
+            for i in range(start, end):
+                row = rows[i]
+                issn = _issn_for_description(row)
+                title = _title_for_description(row)
+                row_key = clean_issn(issn) or f"title:{title.lower()}"
+                if row_key != cache_key or _description_already_set(row):
+                    continue
+                rows[i] = _place_brief_description(row, text)
+                changed = True
+                ready += 1
+            new_since_save += 1
+            if progress_bar is not None:
+                progress_bar.progress(min(1.0, ready / total))
+            if new_since_save >= save_every:
+                _save_progress()
+                new_since_save = 0
+
+    if pending:
+        _map_in_order(pending, _lookup, JOURNAL_FETCH_WORKERS, _store)
     if job_id and platform and changed:
         _save_partial_rows(job_id, platform, rows)
         _save_desc_cache(job_id, cache)
@@ -2763,13 +2847,26 @@ def _format_duration(seconds):
     return f"{hours}h {minutes:02d}m"
 
 
-def _render_job_progress(progress_bar, completed, total, elapsed, label):
+def _render_job_progress(
+    progress_bar,
+    completed,
+    total,
+    elapsed,
+    label,
+    recent_completed=None,
+    recent_elapsed=None,
+):
     total = max(1, int(total))
     completed = min(float(total), max(0.0, float(completed)))
     ratio = completed / total
     whole_done = min(total, int(completed))
-    if completed > 0 and elapsed > 1:
+    rate = None
+    # Prefer the current batch's pace. A resumed job must not keep an old, much slower average.
+    if recent_completed and recent_elapsed and recent_completed >= 1 and recent_elapsed > 2:
+        rate = recent_completed / recent_elapsed
+    elif completed > 0 and elapsed > 1:
         rate = completed / elapsed
+    if rate:
         eta = (total - completed) / rate if rate > 0 else 0
         timing = f"elapsed {_format_duration(elapsed)} · about {_format_duration(eta)} remaining"
     else:
@@ -2802,6 +2899,7 @@ class _MappedProgress:
         self.segment_started = segment_started
         self.label = label
         self._max_completed = base if minimum is None else max(base, minimum)
+        self._recent_origin = None
 
     def progress(self, value, **_kwargs):
         try:
@@ -2809,13 +2907,17 @@ class _MappedProgress:
         except (TypeError, ValueError):
             local = 0.0
         self._max_completed = max(self._max_completed, self.base + self.span * local)
-        elapsed = self.elapsed_base + (time.time() - self.segment_started)
+        if self._recent_origin is None:
+            self._recent_origin = self._max_completed
+        segment_elapsed = time.time() - self.segment_started
         _render_job_progress(
             self.parent,
             self._max_completed,
             self.total,
-            elapsed,
+            self.elapsed_base + segment_elapsed,
             self.label,
+            recent_completed=max(0.0, self._max_completed - self._recent_origin),
+            recent_elapsed=segment_elapsed,
         )
 
 
@@ -2892,7 +2994,8 @@ def run_batched_journal_fetch(
         described = sum(
             not _description_needs_attempt(row, cache) for row in all_rows[:start_idx]
         )
-        initial_work = (start_idx + described) * 0.5
+        metric_share = 1 - _DESCRIPTION_PROGRESS_SHARE
+        initial_work = start_idx * metric_share + described * _DESCRIPTION_PROGRESS_SHARE
     else:
         initial_work = start_idx
     _render_job_progress(
@@ -2910,8 +3013,8 @@ def run_batched_journal_fetch(
         status_text.text(f"Adding journal descriptions to {len(all_rows)} saved {platform.upper()} rows...")
         resume_progress = _MappedProgress(
             progress_bar,
-            progress_offset + start_idx * 0.5,
-            start_idx * 0.5,
+            progress_offset + start_idx * (1 - _DESCRIPTION_PROGRESS_SHARE),
+            start_idx * _DESCRIPTION_PROGRESS_SHARE,
             progress_total,
             elapsed_base,
             segment_started,
@@ -2952,7 +3055,7 @@ def run_batched_journal_fetch(
             f"(auto-saving every {batch_size})..."
         )
         chunk_size = batch_end - batch_start
-        metric_span = chunk_size * (0.5 if include_descriptions else 1.0)
+        metric_span = chunk_size * (1 - _DESCRIPTION_PROGRESS_SHARE if include_descriptions else 1.0)
         metric_progress = _MappedProgress(
             progress_bar,
             progress_offset + batch_start,
@@ -3008,6 +3111,8 @@ def run_batched_journal_fetch(
             progress_total,
             elapsed_total,
             progress_label,
+            recent_completed=max(0.0, batch_end - start_idx),
+            recent_elapsed=time.time() - segment_started,
         )
         batches_run += 1
         if max_batches and batches_run >= max_batches:
@@ -3321,11 +3426,11 @@ if app_mode == "Unified citation search":
                 "Include journal descriptions (slower)",
                 value=True,
                 key="unified_include_descriptions",
-                help="Turn this off when you only need WoS and Scopus metrics. It skips all journal-description web lookups.",
+                help="Turn this off when you only need WoS and Scopus metrics. Descriptions are short Wikipedia summaries, without slow publisher-page lookups.",
             )
 
             st.caption(
-                f"Large lists run automatically in batches of **{JOURNAL_BATCH_SIZE}** ISSNs. "
+                f"Large lists request **{JOURNAL_FETCH_WORKERS}** journals at a time and save every **{JOURNAL_BATCH_SIZE}**. "
                 f"{'Descriptions are saved with each batch.' if unified_include_descriptions else 'Description lookups are off for a faster metrics-only run.'} "
                 "Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
             )
@@ -3414,7 +3519,7 @@ if app_mode == "Unified citation search":
                 status_text = st.empty()
                 provider_count = int(bool(WOS_JOURNAL_API_KEY)) + int(bool(_scopus_ok))
                 core_total = len(clean_issns) * max(1, provider_count)
-                overall_total = core_total * (2 if unified_include_descriptions else 1)
+                overall_total = core_total
                 scopus_offset = len(clean_issns) if WOS_JOURNAL_API_KEY else 0
                 if wos_more:
 
@@ -3876,11 +3981,11 @@ elif app_mode == "Web of Science":
                 "Include journal descriptions (slower)",
                 value=True,
                 key="wos_include_descriptions",
-                help="Turn this off for a faster metrics-only result.",
+                help="Turn this off for a faster metrics-only result. Descriptions are short Wikipedia summaries.",
             )
 
             st.caption(
-                f"Large lists run automatically in batches of **{JOURNAL_BATCH_SIZE}**. "
+                f"Large lists request **{JOURNAL_FETCH_WORKERS}** journals at a time and save every **{JOURNAL_BATCH_SIZE}**. "
                 f"{'Descriptions are saved with each batch.' if wos_include_descriptions else 'Description lookups are off.'} "
                 "Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
             )
@@ -4095,11 +4200,11 @@ elif app_mode == "Scopus":
                 "Include journal descriptions (slower)",
                 value=True,
                 key="scopus_include_descriptions",
-                help="Turn this off for a faster metrics-only result.",
+                help="Turn this off for a faster metrics-only result. Descriptions are short Wikipedia summaries.",
             )
 
             st.caption(
-                f"Large lists run automatically in batches of **{JOURNAL_BATCH_SIZE}**. "
+                f"Large lists request **{JOURNAL_FETCH_WORKERS}** journals at a time and save every **{JOURNAL_BATCH_SIZE}**. "
                 f"{'Descriptions are saved with each batch.' if scopus_include_descriptions else 'Description lookups are off.'} "
                 "Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
             )
