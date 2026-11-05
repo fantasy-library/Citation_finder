@@ -1788,7 +1788,7 @@ def _partial_missing_description_column(job_id, platform):
     return "Brief description" not in header
 
 
-def _find_resumable_job_id(fingerprint, platform):
+def _find_resumable_job_id(fingerprint, platform, include_descriptions=None):
     """Latest job with the same list that is unfinished or still has no descriptions."""
     root = _checkpoint_root()
     best = None
@@ -1803,8 +1803,14 @@ def _find_resumable_job_id(fingerprint, platform):
         done = meta.get(f"{platform}_done", 0)
         total = meta.get(f"{platform}_total", 0)
         unfinished = bool(total) and done < total
+        descriptions_enabled = (
+            bool(include_descriptions)
+            if include_descriptions is not None
+            else meta.get(f"{platform}_include_descriptions", True)
+        )
         needs_description = (
             platform in {"wos", "scopus"}
+            and descriptions_enabled
             and _partial_missing_description_column(meta.get("job_id"), platform)
         )
         if unfinished or needs_description:
@@ -1815,7 +1821,7 @@ def _find_resumable_job_id(fingerprint, platform):
     return best
 
 
-def _find_resumable_job_id_any(fingerprint):
+def _find_resumable_job_id_any(fingerprint, include_descriptions=None):
     """Newest job where either journal platform is unfinished."""
     root = _checkpoint_root()
     best = None
@@ -1834,7 +1840,14 @@ def _find_resumable_job_id_any(fingerprint):
                 and int(meta.get(f"{platform}_done", 0) or 0)
                 < int(meta.get(f"{platform}_total", 0) or 0)
             )
-            or _partial_missing_description_column(job_id, platform)
+            or (
+                (
+                    bool(include_descriptions)
+                    if include_descriptions is not None
+                    else meta.get(f"{platform}_include_descriptions", True)
+                )
+                and _partial_missing_description_column(job_id, platform)
+            )
             for platform in ("wos", "scopus")
         ) or meta.get("unified_finalized") is False
         if unfinished:
@@ -2621,6 +2634,7 @@ def attach_brief_descriptions(
     save_every=5,
     only_from=0,
     only_to=None,
+    checkpoint_callback=None,
 ):
     """Add a Brief description column. cache maps cleaned ISSN -> text across platforms.
 
@@ -2673,6 +2687,8 @@ def attach_brief_descriptions(
         if job_id and platform and new_since_save >= save_every:
             _save_partial_rows(job_id, platform, rows)
             _save_desc_cache(job_id, cache)
+            if checkpoint_callback:
+                checkpoint_callback()
             new_since_save = 0
         if progress_bar is not None:
             progress_bar.progress((n + 1) / total)
@@ -2681,6 +2697,8 @@ def attach_brief_descriptions(
         _save_desc_cache(job_id, cache)
     elif job_id and changed:
         _save_desc_cache(job_id, cache)
+    if checkpoint_callback:
+        checkpoint_callback()
     return rows
 
 
@@ -2709,6 +2727,8 @@ def _ensure_brief_descriptions(df, state_key):
     """Fill N/A descriptions on results already kept in the session, once per table."""
     if df is None or getattr(df, "empty", True):
         return df
+    if "Brief description" not in df.columns:
+        return df
     rows = df.to_dict("records")
     if rows and all(_description_column_set(row) for row in rows):
         return df
@@ -2732,6 +2752,73 @@ def _ensure_brief_descriptions(df, state_key):
     return updated
 
 
+def _format_duration(seconds):
+    seconds = max(0, int(seconds or 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def _render_job_progress(progress_bar, completed, total, elapsed, label):
+    total = max(1, int(total))
+    completed = min(float(total), max(0.0, float(completed)))
+    ratio = completed / total
+    whole_done = min(total, int(completed))
+    if completed > 0 and elapsed > 1:
+        rate = completed / elapsed
+        eta = (total - completed) / rate if rate > 0 else 0
+        timing = f"elapsed {_format_duration(elapsed)} · about {_format_duration(eta)} remaining"
+    else:
+        timing = "estimating remaining time…"
+    progress_bar.progress(
+        ratio,
+        text=f"{label}: {whole_done:,}/{total:,} ({ratio:.1%}) · {timing}",
+    )
+
+
+class _MappedProgress:
+    """Map a chunk's 0–1 progress onto the complete multi-batch job."""
+
+    def __init__(
+        self,
+        parent,
+        base,
+        span,
+        total,
+        elapsed_base,
+        segment_started,
+        label,
+        minimum=None,
+    ):
+        self.parent = parent
+        self.base = base
+        self.span = span
+        self.total = total
+        self.elapsed_base = elapsed_base
+        self.segment_started = segment_started
+        self.label = label
+        self._max_completed = base if minimum is None else max(base, minimum)
+
+    def progress(self, value, **_kwargs):
+        try:
+            local = min(1.0, max(0.0, float(value)))
+        except (TypeError, ValueError):
+            local = 0.0
+        self._max_completed = max(self._max_completed, self.base + self.span * local)
+        elapsed = self.elapsed_base + (time.time() - self.segment_started)
+        _render_job_progress(
+            self.parent,
+            self._max_completed,
+            self.total,
+            elapsed,
+            self.label,
+        )
+
+
 def run_batched_journal_fetch(
     items,
     fetch_chunk_fn,
@@ -2743,6 +2830,11 @@ def run_batched_journal_fetch(
     resume=True,
     batch_size=JOURNAL_BATCH_SIZE,
     max_batches=None,
+    include_descriptions=True,
+    progress_offset=0,
+    progress_total=None,
+    progress_label=None,
+    progress_group=None,
 ):
     """
     Fetch items in batches; after each batch write partial CSV and checkpoint meta.
@@ -2763,8 +2855,12 @@ def run_batched_journal_fetch(
             "fingerprint": fingerprint,
             f"{platform}_done": 0,
             f"{platform}_total": len(items),
+            f"{platform}_include_descriptions": include_descriptions,
             "updated": time.time(),
         }
+        _save_checkpoint_meta(job_id, meta)
+    else:
+        meta[f"{platform}_include_descriptions"] = include_descriptions
         _save_checkpoint_meta(job_id, meta)
 
     if resume and meta.get("fingerprint") == fingerprint:
@@ -2786,19 +2882,66 @@ def run_batched_journal_fetch(
             )
 
     total = len(items)
+    progress_total = int(progress_total or total)
+    progress_label = progress_label or platform.upper()
+    elapsed_key = f"{progress_group or platform}_elapsed_seconds"
+    elapsed_base = float(meta.get(elapsed_key, 0) or 0)
+    segment_started = time.time()
     batches_run = 0
-    if all_rows and any(_description_needs_attempt(row, cache) for row in all_rows):
+    if include_descriptions:
+        described = sum(
+            not _description_needs_attempt(row, cache) for row in all_rows[:start_idx]
+        )
+        initial_work = (start_idx + described) * 0.5
+    else:
+        initial_work = start_idx
+    _render_job_progress(
+        progress_bar,
+        progress_offset + initial_work,
+        progress_total,
+        elapsed_base,
+        progress_label,
+    )
+    if (
+        include_descriptions
+        and all_rows
+        and any(_description_needs_attempt(row, cache) for row in all_rows)
+    ):
         status_text.text(f"Adding journal descriptions to {len(all_rows)} saved {platform.upper()} rows...")
+        resume_progress = _MappedProgress(
+            progress_bar,
+            progress_offset + start_idx * 0.5,
+            start_idx * 0.5,
+            progress_total,
+            elapsed_base,
+            segment_started,
+            progress_label,
+            minimum=progress_offset + initial_work,
+        )
         all_rows = attach_brief_descriptions(
             all_rows,
-            progress_bar,
+            resume_progress,
             status_text,
             cache,
             job_id=job_id,
             platform=platform,
         )
     if start_idx >= total:
-        progress_bar.progress(1.0)
+        elapsed_total = elapsed_base + (time.time() - segment_started)
+        meta = {
+            **_load_checkpoint_meta(job_id),
+            f"{platform}_include_descriptions": include_descriptions,
+            elapsed_key: elapsed_total,
+            "updated": time.time(),
+        }
+        _save_checkpoint_meta(job_id, meta)
+        _render_job_progress(
+            progress_bar,
+            progress_offset + total,
+            progress_total,
+            elapsed_total,
+            progress_label,
+        )
         return all_rows
 
     for batch_start in range(start_idx, total, batch_size):
@@ -2808,32 +2951,64 @@ def run_batched_journal_fetch(
             f"{platform.upper()}: batch {batch_start + 1}–{batch_end} of {total} "
             f"(auto-saving every {batch_size})..."
         )
-        batch_rows = fetch_chunk_fn(chunk, progress_bar, status_text)
+        chunk_size = batch_end - batch_start
+        metric_span = chunk_size * (0.5 if include_descriptions else 1.0)
+        metric_progress = _MappedProgress(
+            progress_bar,
+            progress_offset + batch_start,
+            metric_span,
+            progress_total,
+            elapsed_base,
+            segment_started,
+            progress_label,
+        )
+        batch_rows = fetch_chunk_fn(chunk, metric_progress, status_text)
         described_from = len(all_rows)
         all_rows.extend(batch_rows)
-        status_text.text(
-            f"{platform.upper()}: journal descriptions for rows {described_from + 1}–{len(all_rows)} of {total}..."
-        )
-        all_rows = attach_brief_descriptions(
-            all_rows,
-            progress_bar,
-            status_text,
-            cache,
-            job_id=job_id,
-            platform=platform,
-            only_from=described_from,
-        )
+        if include_descriptions:
+            status_text.text(
+                f"{platform.upper()}: journal descriptions for rows {described_from + 1}–{len(all_rows)} of {total}..."
+            )
+            description_progress = _MappedProgress(
+                progress_bar,
+                progress_offset + batch_start + metric_span,
+                chunk_size - metric_span,
+                progress_total,
+                elapsed_base,
+                segment_started,
+                progress_label,
+            )
+            all_rows = attach_brief_descriptions(
+                all_rows,
+                description_progress,
+                status_text,
+                cache,
+                job_id=job_id,
+                platform=platform,
+                only_from=described_from,
+            )
+        else:
+            _save_partial_rows(job_id, platform, all_rows)
         prev = _load_checkpoint_meta(job_id)
+        elapsed_total = elapsed_base + (time.time() - segment_started)
         meta = {
             **prev,
             "job_id": job_id,
             "fingerprint": fingerprint,
             f"{platform}_done": batch_end,
             f"{platform}_total": total,
+            f"{platform}_include_descriptions": include_descriptions,
+            elapsed_key: elapsed_total,
             "updated": time.time(),
         }
         _save_checkpoint_meta(job_id, meta)
-        progress_bar.progress(batch_end / total)
+        _render_job_progress(
+            progress_bar,
+            progress_offset + batch_end,
+            progress_total,
+            elapsed_total,
+            progress_label,
+        )
         batches_run += 1
         if max_batches and batches_run >= max_batches:
             break
@@ -2850,22 +3025,43 @@ def _job_has_more(job_id, platform, expected_total=0):
         return True
     if total and done < total:
         return True
-    return _partial_missing_description_column(job_id, platform)
+    return (
+        meta.get(f"{platform}_include_descriptions", True)
+        and _partial_missing_description_column(job_id, platform)
+    )
 
 
-def _prepare_journal_job(fingerprint, platform, resume, unified=False):
+def _prepare_journal_job(
+    fingerprint,
+    platform,
+    resume,
+    unified=False,
+    include_descriptions=None,
+):
     """Resolve job_id for a new or resumed run."""
     if resume:
         if unified:
-            existing = _find_resumable_job_id_any(fingerprint)
+            existing = _find_resumable_job_id_any(
+                fingerprint, include_descriptions=include_descriptions
+            )
         else:
-            existing = _find_resumable_job_id(fingerprint, platform)
+            existing = _find_resumable_job_id(
+                fingerprint,
+                platform,
+                include_descriptions=include_descriptions,
+            )
         if existing:
             return existing
     return f"{fingerprint}_{time.time_ns()}"
 
 
-def _render_partial_checkpoint_download(job_id, platform, label, key_suffix):
+def _render_partial_checkpoint_download(
+    job_id,
+    platform,
+    label,
+    key_suffix,
+    include_descriptions=True,
+):
     """Show auto-save status and download button for partial CSV if present."""
     path = _partial_csv_path(job_id, platform)
     meta = _load_checkpoint_meta(job_id)
@@ -2877,6 +3073,8 @@ def _render_partial_checkpoint_download(job_id, platform, label, key_suffix):
         return
     if df.empty:
         return
+    if not include_descriptions and "Brief description" in df.columns:
+        df = df.drop(columns=["Brief description"])
     done = meta.get(f"{platform}_done", len(df))
     total = meta.get(f"{platform}_total", len(df))
     st.caption(
@@ -3095,8 +3293,8 @@ if app_mode == "Unified citation search":
         st.markdown("Search citation counts from **Web of Science**, **Scopus**, and **Google Scholar** in one go.")
         st.caption(f"Paste DOIs (one per line). Platforms with keys in Step 1 will be queried: WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}.")
     else:
-        st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go, with a brief description for each ISSN.")
-        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. Journal Impact Factor uses the latest published year (currently {latest_jif_year()}). A short description is still filled when a journal is not in Web of Science or Scopus.")
+        st.markdown("**Journal metrics by ISSNs** (WoS and Scopus) in one go, with optional journal descriptions.")
+        st.caption(f"Paste ISSNs (one per line). WoS (JCR) {'✓' if WOS_JOURNAL_API_KEY else '—'} · Scopus {'✓' if _scopus_ok else '—'}. Journal Impact Factor uses the latest published year (currently {latest_jif_year()}).")
 
     if not api_unlocked:
         _locked_view(api_reminder)
@@ -3119,10 +3317,17 @@ if app_mode == "Unified citation search":
             )
             unified_citescore_year_param = (unified_scopus_year or "").strip()
             unified_citescore_year_param = unified_citescore_year_param if unified_citescore_year_param.isdigit() else None
+            unified_include_descriptions = st.checkbox(
+                "Include journal descriptions (slower)",
+                value=True,
+                key="unified_include_descriptions",
+                help="Turn this off when you only need WoS and Scopus metrics. It skips all journal-description web lookups.",
+            )
 
             st.caption(
                 f"Large lists run automatically in batches of **{JOURNAL_BATCH_SIZE}** ISSNs. "
-                "Each saved batch includes the journal description. Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
+                f"{'Descriptions are saved with each batch.' if unified_include_descriptions else 'Description lookups are off for a faster metrics-only run.'} "
+                "Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
             )
             unified_resume = st.checkbox(
                 "Resume previous run (same ISSN list)",
@@ -3139,7 +3344,9 @@ if app_mode == "Unified citation search":
                 )
             if not unified_resume:
                 st.session_state["unified_journal_autorun"] = False
-            elif _unified_fp and _find_resumable_job_id_any(_unified_fp):
+            elif _unified_fp and _find_resumable_job_id_any(
+                _unified_fp, include_descriptions=unified_include_descriptions
+            ):
                 st.session_state["unified_journal_autorun"] = True
             _unified_session_job = st.session_state.get("unified_journal_job_id")
             if (
@@ -3159,7 +3366,10 @@ if app_mode == "Unified citation search":
                 and (
                     unified_journal_clicked
                     or _unified_session_job
-                    or _find_resumable_job_id_any(_unified_fp)
+                    or _find_resumable_job_id_any(
+                        _unified_fp,
+                        include_descriptions=unified_include_descriptions,
+                    )
                 )
             )
             if _unified_run_now and not unified_journal_clicked:
@@ -3171,7 +3381,13 @@ if app_mode == "Unified citation search":
                 fp = _unified_fp
                 job_id = (
                     (_unified_session_job if unified_resume else None)
-                    or _prepare_journal_job(fp, "wos", unified_resume, unified=True)
+                    or _prepare_journal_job(
+                        fp,
+                        "wos",
+                        unified_resume,
+                        unified=True,
+                        include_descriptions=unified_include_descriptions,
+                    )
                 )
                 st.session_state["unified_journal_job_id"] = job_id
                 wos_queries = [format_issn_for_wos(issn) for issn in clean_issns]
@@ -3185,15 +3401,21 @@ if app_mode == "Unified citation search":
                 if WOS_JOURNAL_API_KEY:
                     initial_meta.setdefault("wos_done", 0)
                     initial_meta.setdefault("wos_total", len(wos_queries))
+                    initial_meta["wos_include_descriptions"] = unified_include_descriptions
                 if _scopus_ok:
                     initial_meta.setdefault("scopus_done", 0)
                     initial_meta.setdefault("scopus_total", len(clean_issns))
+                    initial_meta["scopus_include_descriptions"] = unified_include_descriptions
                 _save_checkpoint_meta(job_id, initial_meta)
                 wos_more = bool(WOS_JOURNAL_API_KEY) and _job_has_more(job_id, "wos", len(wos_queries))
                 scopus_more = bool(_scopus_ok) and _job_has_more(job_id, "scopus", len(clean_issns))
 
                 progress_bar = st.progress(0)
                 status_text = st.empty()
+                provider_count = int(bool(WOS_JOURNAL_API_KEY)) + int(bool(_scopus_ok))
+                core_total = len(clean_issns) * max(1, provider_count)
+                overall_total = core_total * (2 if unified_include_descriptions else 1)
+                scopus_offset = len(clean_issns) if WOS_JOURNAL_API_KEY else 0
                 if wos_more:
 
                     def _wos_chunk(chunk, pb, stxt):
@@ -3216,6 +3438,11 @@ if app_mode == "Unified citation search":
                         status_text,
                         resume=unified_resume,
                         max_batches=1,
+                        include_descriptions=unified_include_descriptions,
+                        progress_offset=0,
+                        progress_total=overall_total,
+                        progress_label="All journal metrics",
+                        progress_group="unified",
                     )
                 elif scopus_more:
 
@@ -3239,6 +3466,11 @@ if app_mode == "Unified citation search":
                         status_text,
                         resume=unified_resume,
                         max_batches=1,
+                        include_descriptions=unified_include_descriptions,
+                        progress_offset=scopus_offset,
+                        progress_total=overall_total,
+                        progress_label="All journal metrics",
+                        progress_group="unified",
                     )
 
                 wos_more = bool(WOS_JOURNAL_API_KEY) and _job_has_more(job_id, "wos", len(wos_queries))
@@ -3251,42 +3483,134 @@ if app_mode == "Unified citation search":
                 known_titles = _known_journal_titles([wos_journal_rows, scopus_journal_data])
                 _apply_known_journal_titles(wos_journal_rows, known_titles)
                 _apply_known_journal_titles(scopus_journal_data, known_titles)
-                if wos_journal_rows:
+                final_meta = _load_checkpoint_meta(job_id)
+                final_elapsed_key = "unified_elapsed_seconds"
+                final_elapsed_base = float(final_meta.get(final_elapsed_key, 0) or 0)
+                final_started = time.time()
+
+                def _save_final_elapsed():
+                    checkpoint = _load_checkpoint_meta(job_id)
+                    checkpoint[final_elapsed_key] = final_elapsed_base + (
+                        time.time() - final_started
+                    )
+                    checkpoint["updated"] = time.time()
+                    _save_checkpoint_meta(job_id, checkpoint)
+
+                if unified_include_descriptions:
+                    wos_final_done = sum(
+                        not _description_needs_attempt(row, desc_cache)
+                        for row in wos_journal_rows
+                    )
+                    scopus_final_done = sum(
+                        not _description_needs_attempt(row, desc_cache)
+                        for row in scopus_journal_data
+                    )
+                    final_completed = core_total
+                    if WOS_JOURNAL_API_KEY:
+                        final_completed += wos_final_done
+                        if wos_final_done >= len(wos_journal_rows) and _scopus_ok:
+                            final_completed += scopus_final_done
+                    elif _scopus_ok:
+                        final_completed += scopus_final_done
+                    _render_job_progress(
+                        progress_bar,
+                        final_completed,
+                        overall_total,
+                        final_elapsed_base,
+                        "Final description checks",
+                    )
+                if (
+                    unified_include_descriptions
+                    and wos_journal_rows
+                    and wos_final_done < len(wos_journal_rows)
+                ):
+                    wos_final_progress = _MappedProgress(
+                        progress_bar,
+                        core_total,
+                        len(clean_issns),
+                        overall_total,
+                        final_elapsed_base,
+                        final_started,
+                        "Final description checks",
+                        minimum=core_total + wos_final_done,
+                    )
                     wos_journal_rows = attach_brief_descriptions(
                         wos_journal_rows,
-                        progress_bar,
+                        wos_final_progress,
                         status_text,
                         desc_cache,
                         job_id=job_id,
                         platform="wos",
+                        checkpoint_callback=_save_final_elapsed,
                     )
-                if scopus_journal_data:
+                if (
+                    unified_include_descriptions
+                    and scopus_journal_data
+                    and scopus_final_done < len(scopus_journal_data)
+                ):
+                    scopus_final_progress = _MappedProgress(
+                        progress_bar,
+                        core_total + scopus_offset,
+                        len(clean_issns),
+                        overall_total,
+                        final_elapsed_base,
+                        final_started,
+                        "Final description checks",
+                        minimum=core_total + scopus_offset + scopus_final_done,
+                    )
                     scopus_journal_data = attach_brief_descriptions(
                         scopus_journal_data,
-                        progress_bar,
+                        scopus_final_progress,
                         status_text,
                         desc_cache,
                         job_id=job_id,
                         platform="scopus",
+                        checkpoint_callback=_save_final_elapsed,
                     )
+                final_elapsed = final_elapsed_base + (time.time() - final_started)
+                if unified_include_descriptions:
+                    _render_job_progress(
+                        progress_bar,
+                        overall_total,
+                        overall_total,
+                        final_elapsed,
+                        "All journal metrics",
+                    )
+                else:
+                    for row in wos_journal_rows + scopus_journal_data:
+                        row.pop("Brief description", None)
                 status_text.success(f"✅ Finished: WoS {len(wos_journal_rows)} records, Scopus {len(scopus_journal_data)} records.")
                 st.session_state["unified_wos_journal_df"] = pd.DataFrame(wos_journal_rows) if wos_journal_rows else None
                 st.session_state["unified_scopus_journal_df"] = pd.DataFrame(scopus_journal_data) if scopus_journal_data else None
                 final_meta = _load_checkpoint_meta(job_id)
                 final_meta["unified_finalized"] = True
+                final_meta[final_elapsed_key] = final_elapsed
                 final_meta["updated"] = time.time()
                 _save_checkpoint_meta(job_id, final_meta)
                 st.session_state["unified_journal_autorun"] = False
 
             _uj_job = st.session_state.get("unified_journal_job_id")
             if _uj_job:
-                _render_partial_checkpoint_download(_uj_job, "wos", "WoS (JCR)", "unified")
-                _render_partial_checkpoint_download(_uj_job, "scopus", "Scopus", "unified")
+                _render_partial_checkpoint_download(
+                    _uj_job,
+                    "wos",
+                    "WoS (JCR)",
+                    "unified",
+                    include_descriptions=unified_include_descriptions,
+                )
+                _render_partial_checkpoint_download(
+                    _uj_job,
+                    "scopus",
+                    "Scopus",
+                    "unified",
+                    include_descriptions=unified_include_descriptions,
+                )
 
             if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
-                st.session_state["unified_wos_journal_df"] = _ensure_brief_descriptions(
-                    st.session_state["unified_wos_journal_df"], "unified_wos_journal_df"
-                )
+                if unified_include_descriptions:
+                    st.session_state["unified_wos_journal_df"] = _ensure_brief_descriptions(
+                        st.session_state["unified_wos_journal_df"], "unified_wos_journal_df"
+                    )
                 st.divider()
                 st.subheader("WoS (JCR) journal metrics")
                 st.dataframe(st.session_state["unified_wos_journal_df"], width="stretch")
@@ -3298,9 +3622,10 @@ if app_mode == "Unified citation search":
                     key="unified_wos_journal_download_btn",
                 )
             if st.session_state.get("unified_scopus_journal_df") is not None and not st.session_state["unified_scopus_journal_df"].empty:
-                st.session_state["unified_scopus_journal_df"] = _ensure_brief_descriptions(
-                    st.session_state["unified_scopus_journal_df"], "unified_scopus_journal_df"
-                )
+                if unified_include_descriptions:
+                    st.session_state["unified_scopus_journal_df"] = _ensure_brief_descriptions(
+                        st.session_state["unified_scopus_journal_df"], "unified_scopus_journal_df"
+                    )
                 if st.session_state.get("unified_wos_journal_df") is not None and not st.session_state["unified_wos_journal_df"].empty:
                     st.divider()
                 st.subheader("Scopus journal metrics")
@@ -3530,8 +3855,8 @@ elif app_mode == "Web of Science":
                     )
 
         else:
-            st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**, plus a brief description.")
-            st.caption(f"Enter one ISSN or title per line. Leave the year blank to use the latest Journal Impact Factor year ({latest_jif_year()}). The JIF column is labeled with that year. A short description is still filled when a journal is not in Web of Science.")
+            st.markdown("Fetch **journal metrics** (JCR) by **ISSN** or **journal title**, with optional journal descriptions.")
+            st.caption(f"Enter one ISSN or title per line. Leave the year blank to use the latest Journal Impact Factor year ({latest_jif_year()}). The JIF column is labeled with that year.")
             raw_journal_text = st.text_area(
                 "📋 Enter ISSNs or journal titles (one per line)",
                 height=200,
@@ -3547,10 +3872,17 @@ elif app_mode == "Web of Science":
                 default=[],
                 help="Matches the Journals API `edition` parameter. Leave empty to include all editions.",
             )
+            wos_include_descriptions = st.checkbox(
+                "Include journal descriptions (slower)",
+                value=True,
+                key="wos_include_descriptions",
+                help="Turn this off for a faster metrics-only result.",
+            )
 
             st.caption(
                 f"Large lists run automatically in batches of **{JOURNAL_BATCH_SIZE}**. "
-                "Each saved batch includes the journal description. Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
+                f"{'Descriptions are saved with each batch.' if wos_include_descriptions else 'Description lookups are off.'} "
+                "Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
             )
             wos_resume = st.checkbox(
                 "Resume previous run (same ISSN/title list)",
@@ -3560,10 +3892,17 @@ elif app_mode == "Web of Science":
             _wos_queries = [line.strip() for line in raw_journal_text.split("\n") if line.strip()]
             _wos_jcr_year = (jcr_year or "").strip() or (str(resolve_latest_jcr_year(WOS_JOURNAL_API_KEY)) if WOS_JOURNAL_API_KEY else "")
             _wos_edition = ";".join(selected_editions) if selected_editions else ""
-            _wos_fp = _journal_job_fingerprint(_wos_queries, f"wos|{_wos_jcr_year}|{_wos_edition}") if _wos_queries else ""
+            _wos_fp = _journal_job_fingerprint(
+                _wos_queries,
+                f"wos|{_wos_jcr_year}|{_wos_edition}",
+            ) if _wos_queries else ""
             if not wos_resume:
                 st.session_state["wos_journal_autorun"] = False
-            elif _wos_fp and _find_resumable_job_id(_wos_fp, "wos"):
+            elif _wos_fp and _find_resumable_job_id(
+                _wos_fp,
+                "wos",
+                include_descriptions=wos_include_descriptions,
+            ):
                 st.session_state["wos_journal_autorun"] = True
 
             _j1, _j2, _j3 = st.columns([1, 1, 1])
@@ -3575,7 +3914,14 @@ elif app_mode == "Web of Science":
                 WOS_JOURNAL_API_KEY and WOS_JOURNAL_API_KEY.strip()
                 and st.session_state.get("wos_journal_autorun")
                 and _wos_queries
-                and (_wos_journal_clicked or _find_resumable_job_id(_wos_fp, "wos"))
+                and (
+                    _wos_journal_clicked
+                    or _find_resumable_job_id(
+                        _wos_fp,
+                        "wos",
+                        include_descriptions=wos_include_descriptions,
+                    )
+                )
             )
             if _wos_run_now and not _wos_journal_clicked:
                 st.info("Continuing the saved journal list automatically.")
@@ -3587,7 +3933,12 @@ elif app_mode == "Web of Science":
             elif _wos_run_now:
                 jcr_year_val = _wos_jcr_year
                 edition_filter = _wos_edition or None
-                job_id = _prepare_journal_job(_wos_fp, "wos", wos_resume)
+                job_id = _prepare_journal_job(
+                    _wos_fp,
+                    "wos",
+                    wos_resume,
+                    include_descriptions=wos_include_descriptions,
+                )
                 st.session_state["wos_journal_job_id"] = job_id
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -3613,30 +3964,40 @@ elif app_mode == "Web of Science":
                         status_text,
                         resume=wos_resume,
                         max_batches=1,
+                        include_descriptions=wos_include_descriptions,
                     )
                 if _job_has_more(job_id, "wos", len(_wos_queries)):
                     st.rerun()
                 journal_rows = _load_partial_rows(job_id, "wos")
-                journal_rows = attach_brief_descriptions(
-                    journal_rows,
-                    progress_bar,
-                    status_text,
-                    job_id=job_id,
-                    platform="wos",
-                )
+                if wos_include_descriptions:
+                    journal_rows = attach_brief_descriptions(
+                        journal_rows,
+                        None,
+                        status_text,
+                        job_id=job_id,
+                        platform="wos",
+                    )
+                else:
+                    for row in journal_rows:
+                        row.pop("Brief description", None)
                 status_text.success(f"✅ Finished processing {len(journal_rows)} records!")
                 st.session_state["wos_journal_df"] = pd.DataFrame(journal_rows)
                 st.session_state["wos_journal_autorun"] = False
 
             if st.session_state.get("wos_journal_job_id"):
                 _render_partial_checkpoint_download(
-                    st.session_state["wos_journal_job_id"], "wos", "WoS (JCR)", "wos_only"
+                    st.session_state["wos_journal_job_id"],
+                    "wos",
+                    "WoS (JCR)",
+                    "wos_only",
+                    include_descriptions=wos_include_descriptions,
                 )
 
             if "wos_journal_df" in st.session_state and wos_search_mode == "Journal metrics (JCR by ISSN/title)":
-                st.session_state["wos_journal_df"] = _ensure_brief_descriptions(
-                    st.session_state["wos_journal_df"], "wos_journal_df"
-                )
+                if wos_include_descriptions:
+                    st.session_state["wos_journal_df"] = _ensure_brief_descriptions(
+                        st.session_state["wos_journal_df"], "wos_journal_df"
+                    )
                 st.divider()
                 st.dataframe(st.session_state["wos_journal_df"], width="stretch")
                 excel_jcr = to_excel(st.session_state["wos_journal_df"])
@@ -3717,8 +4078,8 @@ elif app_mode == "Scopus":
                 )
 
         else:
-            st.markdown("Fetch **journal metrics** (CiteScore, SNIP, SJR, subject areas) and a brief description by **ISSN**.")
-            st.caption("Enter one ISSN per line (with or without hyphen). A short description is still filled when the journal is not in Scopus.")
+            st.markdown("Fetch **journal metrics** (CiteScore, SNIP, SJR, subject areas) by **ISSN**, with optional journal descriptions.")
+            st.caption("Enter one ISSN per line (with or without hyphen).")
             raw_issn_text = st.text_area("📋 Enter ISSNs (one per line)", height=200, placeholder="2161-797X\n1755-0645\n0309-0566", key="scopus_issn_bulk")
 
             scopus_citescore_year = st.text_input(
@@ -3730,10 +4091,17 @@ elif app_mode == "Scopus":
             )
             citescore_year_param = (scopus_citescore_year or "").strip()
             citescore_year_param = citescore_year_param if citescore_year_param.isdigit() else None
+            scopus_include_descriptions = st.checkbox(
+                "Include journal descriptions (slower)",
+                value=True,
+                key="scopus_include_descriptions",
+                help="Turn this off for a faster metrics-only result.",
+            )
 
             st.caption(
                 f"Large lists run automatically in batches of **{JOURNAL_BATCH_SIZE}**. "
-                "Each saved batch includes the journal description. Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
+                f"{'Descriptions are saved with each batch.' if scopus_include_descriptions else 'Description lookups are off.'} "
+                "Leave this page open; the next batch starts by itself. Uncheck Resume to pause."
             )
             scopus_resume = st.checkbox(
                 "Resume previous run (same ISSN list)",
@@ -3742,11 +4110,16 @@ elif app_mode == "Scopus":
             )
             _scopus_clean = [clean_issn(line) for line in raw_issn_text.split("\n") if clean_issn(line)]
             _scopus_fp = _journal_job_fingerprint(
-                _scopus_clean, f"scopus|{citescore_year_param or latest_citescore_year()}"
+                _scopus_clean,
+                f"scopus|{citescore_year_param or latest_citescore_year()}",
             ) if _scopus_clean else ""
             if not scopus_resume:
                 st.session_state["scopus_journal_autorun"] = False
-            elif _scopus_fp and _find_resumable_job_id(_scopus_fp, "scopus"):
+            elif _scopus_fp and _find_resumable_job_id(
+                _scopus_fp,
+                "scopus",
+                include_descriptions=scopus_include_descriptions,
+            ):
                 st.session_state["scopus_journal_autorun"] = True
 
             _j1, _j2, _j3 = st.columns([1, 1, 1])
@@ -3757,14 +4130,26 @@ elif app_mode == "Scopus":
             _scopus_run_now = bool(
                 st.session_state.get("scopus_journal_autorun")
                 and _scopus_clean
-                and (_journal_clicked or _find_resumable_job_id(_scopus_fp, "scopus"))
+                and (
+                    _journal_clicked
+                    or _find_resumable_job_id(
+                        _scopus_fp,
+                        "scopus",
+                        include_descriptions=scopus_include_descriptions,
+                    )
+                )
             )
             if _scopus_run_now and not _journal_clicked:
                 st.info("Continuing the saved ISSN list automatically.")
             if _journal_clicked and not _scopus_clean:
                 st.warning("Please enter valid 8-character ISSNs (with or without hyphen).")
             elif _scopus_run_now:
-                job_id = _prepare_journal_job(_scopus_fp, "scopus", scopus_resume)
+                job_id = _prepare_journal_job(
+                    _scopus_fp,
+                    "scopus",
+                    scopus_resume,
+                    include_descriptions=scopus_include_descriptions,
+                )
                 st.session_state["scopus_journal_job_id"] = job_id
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -3790,30 +4175,40 @@ elif app_mode == "Scopus":
                         status_text,
                         resume=scopus_resume,
                         max_batches=1,
+                        include_descriptions=scopus_include_descriptions,
                     )
                 if _job_has_more(job_id, "scopus", len(_scopus_clean)):
                     st.rerun()
                 journal_data = _load_partial_rows(job_id, "scopus")
-                journal_data = attach_brief_descriptions(
-                    journal_data,
-                    progress_bar,
-                    status_text,
-                    job_id=job_id,
-                    platform="scopus",
-                )
+                if scopus_include_descriptions:
+                    journal_data = attach_brief_descriptions(
+                        journal_data,
+                        None,
+                        status_text,
+                        job_id=job_id,
+                        platform="scopus",
+                    )
+                else:
+                    for row in journal_data:
+                        row.pop("Brief description", None)
                 status_text.success(f"✅ Finished processing {len(journal_data)} records!")
                 st.session_state["scopus_journal_df"] = pd.DataFrame(journal_data)
                 st.session_state["scopus_journal_autorun"] = False
 
             if st.session_state.get("scopus_journal_job_id"):
                 _render_partial_checkpoint_download(
-                    st.session_state["scopus_journal_job_id"], "scopus", "Scopus", "scopus_only"
+                    st.session_state["scopus_journal_job_id"],
+                    "scopus",
+                    "Scopus",
+                    "scopus_only",
+                    include_descriptions=scopus_include_descriptions,
                 )
 
             if "scopus_journal_df" in st.session_state:
-                st.session_state["scopus_journal_df"] = _ensure_brief_descriptions(
-                    st.session_state["scopus_journal_df"], "scopus_journal_df"
-                )
+                if scopus_include_descriptions:
+                    st.session_state["scopus_journal_df"] = _ensure_brief_descriptions(
+                        st.session_state["scopus_journal_df"], "scopus_journal_df"
+                    )
                 st.divider()
                 st.dataframe(st.session_state["scopus_journal_df"], width="stretch")
                 excel_journal = to_excel(st.session_state["scopus_journal_df"])
