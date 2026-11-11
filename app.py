@@ -1964,7 +1964,7 @@ def _row_query_key(row):
 _PUBLIC_UA = "AcademicDatabaseSearch/1.0 (journal brief description; local research tool)"
 _HTML_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 _DESC_MAX_WORDS = 299
-_DESC_VERSION = "6"
+_DESC_VERSION = "8"
 _public_http = None
 _GARBAGE_SENTENCE = re.compile(
     r"^(indexed in|indexing|impact factor|journal impact factor|editors?-in-?\s*chiefs?|publishing model|submission to|downloads\b|prof\.)\b|\bview all editors\b",
@@ -1974,10 +1974,22 @@ _GARBAGE_PAGE = re.compile(
     r"\b(cookie policy|essential cookies|privacy preference|your privacy|enable javascript|access denied|just a moment|sign in to|subscribe to continue|captcha|are you a robot|403 forbidden|page not found|cookies_not_supported)\b",
     re.I,
 )
+_PUBLISHER_WALL = re.compile(
+    r"login\s*alert|alert\s*cancel|log\s*in\s*alert|institutional\s+(?:login|access)|"
+    r"sign\s+in\s+to\s+(?:view|access|continue|read)|purchase\s+access|personal\s+sign\s+in|"
+    r"access\s+through\s+your\s+institution|recommend\s+you\s+sign\s+in|username\s+or\s+email|"
+    r"ip\s+address\s+was\s+not\s+recognized|personalsignin|shibboleth|"
+    r"remote\s+access\s+sign\s+in|view\s+full\s+text\s+options",
+    re.I,
+)
 _CHALLENGE_TEXT = re.compile(
     r"security verification|malicious bots|not a bot|checking your browser|"
     r"cf-browser-verification|enable javascript and cookies|ddos protection|"
     r"verify you are human|bot detection|attention required",
+    re.I,
+)
+_WIKIDATA_GENERIC = re.compile(
+    r"^(?:a\s+)?(?:peer-?reviewed\s+)?(?:academic\s+|scientific\s+)?journal(?:\s+published\s+.+)?\.?$",
     re.I,
 )
 _SPRINGER_JOURNAL = re.compile(
@@ -2042,7 +2054,7 @@ def _public_get_json(url, params=None, timeout=30):
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}{urlencode(params)}"
     host = url.split("/")[2] if "://" in url else ""
-    wikimedia = host.endswith(("wikipedia.org", "wikidata.org", "wikimedia.org"))
+    wikimedia = host.endswith(("wikipedia.org", "wikidata.org", "wikimedia.org", "query.wikidata.org"))
     if wikimedia and _curl_executable():
         return _curl_get_json(url, timeout)
     headers = {"User-Agent": _PUBLIC_UA, "Accept": "application/json"}
@@ -2135,9 +2147,27 @@ def _normalize_prose(text):
 
 
 def _is_challenge_text(value):
-    """True when a publisher returned a bot check instead of a journal description."""
+    """True when a publisher returned a bot check or login wall instead of a journal description."""
     text = "" if value is None else str(value)
-    return bool(_CHALLENGE_TEXT.search(text) or _GARBAGE_PAGE.search(text))
+    compact = " ".join(text.lower().split())
+    if _CHALLENGE_TEXT.search(text) or _GARBAGE_PAGE.search(text) or _PUBLISHER_WALL.search(text):
+        return True
+    if compact in {"login alert cancel", "log in alert cancel", "alert cancel"}:
+        return True
+    if len(compact) < 120 and _PUBLISHER_WALL.search(compact[:200]):
+        return True
+    return False
+
+
+def _limit_short_trusted(text):
+    """Wikidata-style one-line descriptions when nothing longer is available."""
+    text = _normalize_prose(text)
+    if not text or _is_challenge_text(text) or _WIKIDATA_GENERIC.search(text):
+        return ""
+    words = text.split()
+    if len(words) < 4 or len(text) < 20:
+        return ""
+    return " ".join(words[:_DESC_MAX_WORDS])
 
 
 def _limit_description(text):
@@ -2193,6 +2223,8 @@ def _meta_descriptions(page_html):
         }
         name = (attrs.get("name") or attrs.get("property") or "").lower()
         if name in {"description", "og:description"} and attrs.get("content"):
+            if _is_challenge_text(attrs["content"]):
+                continue
             found.append(attrs["content"])
     return found
 
@@ -2255,12 +2287,30 @@ def _harvest_page_description(url):
 
 
 def _extra_page_urls(url):
-    match = _SPRINGER_JOURNAL.search(str(url or ""))
-    if not match:
+    """Common aims-and-scope paths for large publishers."""
+    raw = str(url or "").strip()
+    if not raw.startswith("http"):
         return []
-    journal_id = match.group(1)
-    base = f"https://link.springer.com/journal/{journal_id}"
-    return [base, base + "/aims-and-scope"]
+    out = []
+    match = _SPRINGER_JOURNAL.search(raw)
+    if match:
+        base = f"https://link.springer.com/journal/{match.group(1)}"
+        out.extend([base, base + "/aims-and-scope"])
+    lowered = raw.lower()
+    if "sciencedirect.com/journal/" in lowered:
+        base = raw.split("?")[0].rstrip("/")
+        if not base.endswith("/about"):
+            out.append(base + "/about")
+    wiley = re.match(r"(https?://onlinelibrary\.wiley\.com/journal/[^/?#]+)", raw, flags=re.I)
+    if wiley:
+        out.append(wiley.group(1) + "/homepage/productinformation.html")
+    tandf = re.search(r"(https?://www\.tandfonline\.com/journals/[a-z0-9]+)", raw, flags=re.I)
+    if tandf:
+        out.append(tandf.group(1) + "/about-this-journal")
+    oup = re.search(r"(https?://academic\.oup\.com/[^/?#]+)", raw, flags=re.I)
+    if oup:
+        out.append(oup.group(1) + "/about")
+    return out
 
 
 def _markdown_to_prose(md):
@@ -2286,7 +2336,13 @@ def _description_from_markdown(md):
     else:
         chunk = ""
         for part in re.split(r"^## ", text, flags=re.M):
-            if re.search(r"privacy|cookie|editorial board|latest articles|journal menu", part[:120], re.I):
+            if re.search(
+                r"privacy|cookie|editorial board|latest articles|journal menu|login|sign in|institutional access",
+                part[:160],
+                re.I,
+            ):
+                continue
+            if _is_challenge_text(part[:500]):
                 continue
             if len(part.split()) >= 20:
                 chunk = part
@@ -2451,40 +2507,175 @@ def _nlm_catalog_prose(issn):
     return _best_description(useful)
 
 
-def _wayback_snapshot_url(url):
-    """Latest archived copy of a publisher page, when the live site shows a bot check."""
-    if not url or not str(url).startswith("http"):
+def _wikidata_qid_by_issn(issn):
+    cleaned = clean_issn(issn)
+    if not cleaned:
         return ""
+    candidates = []
+    hyphen = format_issn_for_wos(cleaned)
+    if hyphen:
+        candidates.append(hyphen)
+    if cleaned not in candidates:
+        candidates.append(cleaned)
+    for value in candidates:
+        query = f'SELECT ?item WHERE {{ ?item wdt:P236 "{value}" . }} LIMIT 1'
+        data, _status = _public_get_json(
+            "https://query.wikidata.org/sparql",
+            params={"query": query, "format": "json"},
+            timeout=25,
+        )
+        bindings = ((data or {}).get("results") or {}).get("bindings") or []
+        if not bindings:
+            continue
+        uri = (bindings[0].get("item") or {}).get("value") or ""
+        qid = uri.rstrip("/").split("/")[-1]
+        if qid.startswith("Q"):
+            return qid
+    return ""
+
+
+def _wikidata_entity_prose(qid):
+    if not qid.startswith("Q"):
+        return ""
+    params = {
+        "action": "wbgetentities",
+        "ids": qid,
+        "props": "sitelinks|descriptions",
+        "sitefilter": "enwiki",
+        "languages": "en",
+        "format": "json",
+    }
+    wd, wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=params)
+    if wd_status == 429:
+        time.sleep(2)
+        wd, _wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=params)
+    entity = ((wd or {}).get("entities") or {}).get(qid) or {}
+    wiki_title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
+    wiki_text = _wikipedia_extract(wiki_title)
+    text = _limit_description(wiki_text)
+    if text:
+        return text
+    wd_desc = ((entity.get("descriptions") or {}).get("en") or {}).get("value") or ""
+    return _limit_short_trusted(wd_desc)
+
+
+def _wikidata_prose_by_issn(issn):
+    return _wikidata_entity_prose(_wikidata_qid_by_issn(issn))
+
+
+def _crossref_subjects_prose(issn):
+    cleaned = clean_issn(issn)
+    if not cleaned:
+        return ""
+    hyphen = format_issn_for_wos(cleaned)
+    data, _status = _public_get_json(f"https://api.crossref.org/journals/{hyphen}")
+    message = (data or {}).get("message") if isinstance(data, dict) else None
+    if not isinstance(message, dict):
+        return ""
+    names = []
+    for item in message.get("subjects") or []:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            name = (item.get("name") or item.get("display_name") or "").strip()
+        else:
+            name = ""
+        if name and name not in names:
+            names.append(name)
+    if len(names) < 2:
+        return ""
+    text = "Crossref subject areas for this journal include " + ", ".join(names[:8]) + "."
+    return _limit_description(text) or _limit_short_trusted(text)
+
+
+def _openalex_topics_prose(data):
+    if not isinstance(data, dict):
+        return ""
+    names = []
+    for topic in (data.get("topics") or [])[:6]:
+        if not isinstance(topic, dict):
+            continue
+        name = (topic.get("display_name") or "").strip()
+        if not name or name in names:
+            continue
+        if name.lower() in {"research", "science", "academia"}:
+            continue
+        names.append(name)
+    if len(names) < 2:
+        return ""
+    text = "OpenAlex commonly associates this journal with " + "; ".join(names[:5]) + "."
+    return _limit_description(text) or _limit_short_trusted(text)
+
+
+def _wayback_snapshot_urls(url, limit=4):
+    """Several archived publisher copies, newest first."""
+    if not url or not str(url).startswith("http"):
+        return []
+    snapshots = []
+    data, _status = _public_get_json(
+        "https://web.archive.org/cdx/search/cdx",
+        params={
+            "url": str(url).strip(),
+            "output": "json",
+            "limit": str(max(3, limit + 2)),
+            "filter": "statuscode:200",
+            "collapse": "digest",
+        },
+        timeout=20,
+    )
+    if isinstance(data, list) and len(data) > 1:
+        for row in data[1:]:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            timestamp, original = str(row[1]), str(row[2])
+            if not timestamp.isdigit() or not original.startswith("http"):
+                continue
+            snapshots.append(f"https://web.archive.org/web/{timestamp}id_/{original}")
+    if snapshots:
+        return snapshots[:limit]
     data, _status = _public_get_json(
         "https://archive.org/wayback/available",
         params={"url": url},
         timeout=15,
     )
     closest = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
-    if not closest.get("available"):
-        return ""
     snapshot = closest.get("url") or ""
-    if not isinstance(snapshot, str) or "/web/" not in snapshot:
-        return ""
-    return re.sub(r"(/web/\d+)/", r"\1id_/", snapshot, count=1)
+    if closest.get("available") and isinstance(snapshot, str) and "/web/" in snapshot:
+        snapshots.append(re.sub(r"(/web/\d+)/", r"\1id_/", snapshot, count=1))
+    return snapshots
+
+
+def _wayback_snapshot_url(url):
+    snapshots = _wayback_snapshot_urls(url, limit=1)
+    return snapshots[0] if snapshots else ""
 
 
 def _archived_page_description(url):
-    snapshot = _wayback_snapshot_url(url)
-    if not snapshot:
-        return ""
-    return _harvest_page_description(snapshot)
-
-
-def _fallback_page_description(urls):
-    """Archived publisher page, then one reader-proxy attempt. Bot-check text is discarded."""
-    candidates = [url for url in _unique_urls(urls) if url and str(url).startswith("http")]
-    for url in candidates[:2]:
-        text = _archived_page_description(url)
-        if text:
+    for snapshot in _wayback_snapshot_urls(url, limit=4):
+        text = _harvest_page_description(snapshot)
+        if text and not _is_challenge_text(text):
             return text
-    if candidates:
-        return _jina_description(candidates[0], timeout=10)
+    return ""
+
+
+def _fallback_page_description(urls, issn=""):
+    """Archived publisher pages, then a reader proxy. Login walls are discarded."""
+    seed = [url for url in _unique_urls(urls) if url and str(url).startswith("http")]
+    expanded = []
+    for url in seed:
+        expanded.append(url)
+        expanded.extend(_extra_page_urls(url))
+    if issn:
+        expanded.extend(_catalog_page_urls(issn))
+    candidates = _unique_urls(expanded)
+    for url in candidates[:6]:
+        text = _archived_page_description(url)
+        if text and not _is_challenge_text(text):
+            return text
+    for url in candidates[:3]:
+        text = _jina_description(url, timeout=12)
+        if text and not _is_challenge_text(text):
+            return text
     return ""
 
 
@@ -2562,6 +2753,68 @@ def _wikipedia_search_extract(title):
         name = hit.get("title") or ""
         if " ".join(name.lower().split()) in wanted:
             return _wikipedia_extract(name)
+    loose, _status = _public_get_json(
+        "https://en.wikipedia.org/w/api.php",
+        params={
+            "action": "query",
+            "list": "search",
+            "srsearch": f'"{title}" journal',
+            "srlimit": "8",
+            "format": "json",
+        },
+    )
+    loose_hits = ((loose or {}).get("query") or {}).get("search") if isinstance(loose, dict) else None
+    base = " ".join(title.lower().split())
+    for hit in loose_hits or []:
+        name = hit.get("title") or ""
+        lowered = " ".join(name.lower().split())
+        if "(journal)" not in lowered and base not in lowered:
+            continue
+        extract = _wikipedia_extract(name)
+        if _limit_description(extract):
+            return extract
+    return ""
+
+
+def _wikipedia_opensearch_extract(title):
+    """English Wikipedia titles from OpenSearch when the exact-title query misses."""
+    title = " ".join(str(title or "").split())
+    if len(title) < 3:
+        return ""
+    data, status = _public_get_json(
+        "https://en.wikipedia.org/w/api.php",
+        params={
+            "action": "opensearch",
+            "search": title,
+            "limit": "8",
+            "namespace": "0",
+            "format": "json",
+        },
+    )
+    if status == 429:
+        time.sleep(2)
+        data, _status = _public_get_json(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "opensearch",
+                "search": title,
+                "limit": "8",
+                "namespace": "0",
+                "format": "json",
+            },
+        )
+    if not isinstance(data, list) or len(data) < 2:
+        return ""
+    wanted = " ".join(title.lower().split())
+    for name in data[1]:
+        lowered = " ".join(str(name or "").lower().split())
+        if "disambiguation" in lowered:
+            continue
+        if wanted not in lowered and "(journal)" not in lowered and "journal" not in lowered:
+            continue
+        extract = _wikipedia_extract(name)
+        if _limit_description(extract):
+            return extract
     return ""
 
 
@@ -2629,12 +2882,14 @@ def _description_from_source(data, issn_for_doaj=""):
     wikidata_url = ((data.get("ids") or {}).get("wikidata") or "").strip()
     qid = wikidata_url.rstrip("/").split("/")[-1]
     wiki_text = ""
+    wd_desc = ""
     if qid.startswith("Q"):
         wd_params = {
             "action": "wbgetentities",
             "ids": qid,
-            "props": "sitelinks",
+            "props": "sitelinks|descriptions",
             "sitefilter": "enwiki",
+            "languages": "en",
             "format": "json",
         }
         wd, wd_status = _public_get_json("https://www.wikidata.org/w/api.php", params=wd_params)
@@ -2644,10 +2899,15 @@ def _description_from_source(data, issn_for_doaj=""):
         entity = ((wd or {}).get("entities") or {}).get(qid) or {}
         wiki_title = ((entity.get("sitelinks") or {}).get("enwiki") or {}).get("title")
         wiki_text = _wikipedia_extract(wiki_title)
+        wd_desc = ((entity.get("descriptions") or {}).get("en") or {}).get("value") or ""
 
     text = _limit_description(wiki_text)
     if text:
         return text
+    if qid.startswith("Q"):
+        text = _limit_short_trusted(wd_desc)
+        if text:
+            return text
 
     hyphen = format_issn_for_wos(clean_issn(issn_for_doaj) or "")
     if not hyphen and data.get("issn_l"):
@@ -2657,14 +2917,24 @@ def _description_from_source(data, issn_for_doaj=""):
     if text:
         return text
     text = _nlm_catalog_prose(issn_for_doaj or data.get("issn_l") or "")
-    return text or ""
+    if text:
+        return text
+    lookup_issn = issn_for_doaj or data.get("issn_l") or ""
+    text = _wikidata_prose_by_issn(lookup_issn)
+    if text:
+        return text
+    text = _crossref_subjects_prose(lookup_issn)
+    if text:
+        return text
+    return _openalex_topics_prose(data) or ""
 
 
 def fetch_journal_brief_description(issn=None, title=None):
     """Short journal overview. Does not require the journal to be in WoS or Scopus.
 
-    Wikipedia, DOAJ, or the NLM Catalog supply the description first. If those have
-    no text, an archived copy of the publisher page is tried, then a reader proxy.
+    Wikipedia, Wikidata, DOAJ, NLM, Crossref subjects, and OpenAlex topics supply text
+    first. If those have no prose, several archived publisher pages are tried, then a
+    reader proxy as a last resort.
     A bot-check page is discarded rather than saved.
     """
     source = _openalex_source_by_issn(issn) if issn else None
@@ -2704,9 +2974,12 @@ def fetch_journal_brief_description(issn=None, title=None):
         text = _limit_description(_wikipedia_search_extract(resolved_title))
         if text:
             return _result(text)
+        text = _limit_description(_wikipedia_opensearch_extract(resolved_title))
+        if text:
+            return _result(text)
     hyphen = format_issn_for_wos(clean_issn(issn) or "")
     aims = _doaj_aims_url(hyphen) if hyphen else ""
-    text = _fallback_page_description([aims, homepage])
+    text = _fallback_page_description([aims, homepage], issn=issn or "")
     return _result(text)
 
 
