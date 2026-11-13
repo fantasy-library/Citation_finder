@@ -1021,7 +1021,12 @@ def _parse_scopus_publication_id(payload):
     if not isinstance(payload, dict):
         return None
     core = (payload.get("abstracts-retrieval-response") or {}).get("coredata") or payload.get("coredata") or {}
-    for key in ("dc:identifier", "eid", "prism:eid"):
+    identifier = str(core.get("dc:identifier") or "").strip()
+    if identifier:
+        match = re.search(r"(?:SCOPUS_ID:\s*)?(\d{8,})", identifier, re.I)
+        if match:
+            return match.group(1)
+    for key in ("eid", "prism:eid"):
         text = str(core.get(key) or "").strip()
         if not text:
             continue
@@ -1240,20 +1245,24 @@ def fetch_doi_fwci(doi, api_key, inst_token):
             return "N/A", api_error_message("Scopus", status, body)
         if status == 429:
             return "N/A", api_error_message("Scopus", 429, body)
+        if status is None and body:
+            return "N/A", f"Scopus ID lookup failed: {body}"
         return "N/A", "Could not resolve a Scopus publication ID for this DOI."
     metrics, scival_status, scival_body = fetch_fwci_for_publication_ids([pub_id], api_key, inst_token)
     if scival_status in (401, 403):
         return "N/A", api_error_message("Scival", scival_status, scival_body)
     if scival_status == 429:
-        return "N/A", api_error_message("Scopus", 429, scival_body)
+        return "N/A", api_error_message("Scival", 429, scival_body)
     if scival_status and scival_status != 200:
-        return "N/A", api_error_message("Scopus", scival_status, scival_body)
+        return "N/A", api_error_message("Scival", scival_status, scival_body)
     value = metrics.get(str(pub_id))
     if value is None:
         for key, metric_value in metrics.items():
             if key.lstrip("0") == str(pub_id).lstrip("0"):
                 value = metric_value
                 break
+    if value is None and len(metrics) == 1:
+        value = next(iter(metrics.values()))
     if value is None:
         return "N/A", "FWCI not available for this publication in SciVal."
     text = f"{value:.3f}".rstrip("0").rstrip(".")
