@@ -1355,21 +1355,21 @@ def _parse_fwci_metrics(payload, requested_ids=None, publication_year=None):
     return found
 
 
-# SciVal Publication Lookup — matches dev.elsevier.com publicationMetrics defaults.
+# SciVal Publication Lookup — primary params validated against Publication Lookup API
+# (10yrs + byYear=false returns headline FWCI in metrics[].value for many documents).
 _SCIVAL_FWCI_PARAMS = {
     "metricTypes": "FieldWeightedCitationImpact",
-    "yearRange": "5yrs",
-    "byYear": "true",
+    "yearRange": "10yrs",
+    "byYear": "false",
     "includedDocs": "AllPublicationTypes",
     "journalImpactType": "CiteScore",
     "showAsFieldWeighted": "false",
 }
 
 _FWCI_METRIC_FALLBACKS = (
+    {"byYear": "true", "yearRange": "5yrs"},
     {"byYear": "false", "yearRange": "5yrs"},
-    {"byYear": "false", "yearRange": "10yrs"},
     {"byYear": "true", "yearRange": "10yrs"},
-    {"byYear": "false", "yearRange": "5yrsAndCurrent"},
     {"byYear": "true", "yearRange": "5yrsAndCurrent"},
 )
 
@@ -1520,7 +1520,7 @@ def fetch_doi_fwci(doi, api_key, inst_token):
     return (
         "N/A",
         f"FWCI empty in SciVal API for publication ID {pub_id}{year_hint}. "
-        f"If Scopus.com shows FWCI, try yearRange=10yrs or byYear=false in Publication Lookup; the weekly API snapshot can lag the website.",
+        f"Try Publication Lookup with yearRange=10yrs and byYear=false (FieldWeightedCitationImpact).",
     )
 
 
