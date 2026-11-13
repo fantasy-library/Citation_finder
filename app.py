@@ -1036,6 +1036,21 @@ def _parse_scopus_publication_id(payload):
     return None
 
 
+def _parse_scopus_publication_year(payload):
+    """Publication year from Abstract Retrieval coredata (for FWCI valueByYear)."""
+    if not isinstance(payload, dict):
+        return None
+    core = (payload.get("abstracts-retrieval-response") or {}).get("coredata") or payload.get("coredata") or {}
+    for key in ("prism:coverDate", "coverDate", "prism:coverDisplayDate"):
+        match = re.search(r"(\d{4})", str(core.get(key) or ""))
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+    return None
+
+
 def _scopus_id_from_search(doi, api_key, inst_token):
     """Resolve Scopus publication ID via Scopus Search API (DOI query)."""
     doi_text = str(doi or "").strip()
@@ -1081,7 +1096,7 @@ def fetch_scopus_publication_id(doi, api_key, inst_token, _retry_count=0, view="
     """Map a DOI to a Scopus publication ID (Abstract Retrieval)."""
     encoded = quote(str(doi or "").strip(), safe="")
     if not encoded:
-        return None, None, "Missing DOI"
+        return None, None, None, "Missing DOI"
     url = (
         f"https://api.elsevier.com/content/abstract/doi/{encoded}"
         f"?apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json"
@@ -1091,17 +1106,19 @@ def fetch_scopus_publication_id(doi, api_key, inst_token, _retry_count=0, view="
     try:
         response = requests.get(url, timeout=30)
     except requests.RequestException as exc:
-        return None, None, str(exc)[:120]
+        return None, None, None, str(exc)[:120]
     if response.status_code == 429 and _retry_count < 2:
         time.sleep(2)
         return fetch_scopus_publication_id(doi, api_key, inst_token, _retry_count + 1, view=view)
     if response.status_code != 200:
-        return None, response.status_code, response.text
+        return None, None, response.status_code, response.text
     try:
         payload = response.json()
     except ValueError:
-        return None, response.status_code, response.text
-    return _parse_scopus_publication_id(payload), response.status_code, None
+        return None, None, response.status_code, response.text
+    pub_id = _parse_scopus_publication_id(payload)
+    pub_year = _parse_scopus_publication_year(payload)
+    return pub_id, pub_year, response.status_code, None
 
 
 def _coerce_fwci_number(raw):
@@ -1147,6 +1164,25 @@ def _coerce_fwci_number(raw):
     return None
 
 
+def _fwci_from_value_by_year(raw, publication_year=None):
+    """Pick FWCI from SciVal valueByYear; prefer the document's publication year."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return _coerce_fwci_number(raw)
+    if publication_year is not None:
+        for ykey in (publication_year, str(publication_year)):
+            if ykey in raw:
+                parsed = _coerce_fwci_number(raw[ykey])
+                if parsed is not None:
+                    return parsed
+    for ykey in sorted(raw.keys(), key=lambda k: str(k), reverse=True):
+        parsed = _coerce_fwci_number(raw[ykey])
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _publication_id_from_result_block(block):
     """Scopus publication id from a SciVal result block, if present."""
     if not isinstance(block, dict):
@@ -1177,14 +1213,14 @@ def _publication_id_from_result_block(block):
     return None
 
 
-def _extract_fwci_from_metric(metric):
+def _extract_fwci_from_metric(metric, publication_year=None):
     if not isinstance(metric, dict):
         return None
-    mtype = (metric.get("metricType") or metric.get("type") or "").strip()
+    mtype = (metric.get("metricType") or metric.get("type") or metric.get("@type") or "").strip()
     if mtype == "FieldWeightedCitationImpact":
         parsed = (
             _coerce_fwci_number(metric.get("value"))
-            or _coerce_fwci_number(metric.get("valueByYear"))
+            or _fwci_from_value_by_year(metric.get("valueByYear"), publication_year)
         )
         if parsed is not None:
             return parsed
@@ -1198,7 +1234,7 @@ def _extract_fwci_from_metric(metric):
                     continue
                 parsed = (
                     _coerce_fwci_number(item.get("value"))
-                    or _coerce_fwci_number(item.get("valueByYear"))
+                    or _fwci_from_value_by_year(item.get("valueByYear"), publication_year)
                 )
                 if parsed is not None:
                     return parsed
@@ -1206,12 +1242,12 @@ def _extract_fwci_from_metric(metric):
     nested = metric.get("FieldWeightedCitationImpact")
     if nested is not None:
         if isinstance(nested, dict):
-            return _extract_fwci_from_metric(nested) or _coerce_fwci_number(nested)
+            return _extract_fwci_from_metric(nested, publication_year) or _coerce_fwci_number(nested)
         return _coerce_fwci_number(nested)
     return None
 
 
-def _fwci_from_metric_list(metrics):
+def _fwci_from_metric_list(metrics, publication_year=None):
     if isinstance(metrics, dict):
         metrics = [metrics]
     if not isinstance(metrics, list):
@@ -1219,36 +1255,69 @@ def _fwci_from_metric_list(metrics):
     for metric in metrics:
         if not isinstance(metric, dict):
             continue
-        if (metric.get("metricType") or metric.get("type") or "").strip() == "FieldWeightedCitationImpact":
-            parsed = _extract_fwci_from_metric(metric)
+        mtype = (metric.get("metricType") or metric.get("type") or metric.get("@type") or "").strip()
+        if mtype == "FieldWeightedCitationImpact":
+            parsed = _extract_fwci_from_metric(metric, publication_year)
             if parsed is not None:
                 return parsed
         for key, val in metric.items():
             if key != "FieldWeightedCitationImpact":
                 continue
-            parsed = _extract_fwci_from_metric(val) if isinstance(val, dict) else _coerce_fwci_number(val)
+            parsed = (
+                _extract_fwci_from_metric(val, publication_year) if isinstance(val, dict) else _coerce_fwci_number(val)
+            )
             if parsed is not None:
                 return parsed
     for metric in metrics:
-        parsed = _extract_fwci_from_metric(metric)
+        parsed = _extract_fwci_from_metric(metric, publication_year)
         if parsed is not None:
             return parsed
     return None
 
 
-def _fwci_from_result_block(block):
+def _deep_scan_fwci_payload(obj, publication_year=None, _depth=0):
+    if _depth > 14:
+        return None
+    if isinstance(obj, dict):
+        mtype = str(obj.get("metricType") or obj.get("type") or obj.get("@type") or "")
+        if "FieldWeightedCitationImpact" in mtype:
+            parsed = _extract_fwci_from_metric(obj, publication_year)
+            if parsed is not None:
+                return parsed
+        if "FieldWeightedCitationImpact" in obj:
+            branch = obj["FieldWeightedCitationImpact"]
+            parsed = (
+                _extract_fwci_from_metric(branch, publication_year)
+                if isinstance(branch, dict)
+                else _coerce_fwci_number(branch)
+            )
+            if parsed is not None:
+                return parsed
+        for val in obj.values():
+            parsed = _deep_scan_fwci_payload(val, publication_year, _depth + 1)
+            if parsed is not None:
+                return parsed
+    elif isinstance(obj, list):
+        for item in obj:
+            parsed = _deep_scan_fwci_payload(item, publication_year, _depth + 1)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _fwci_from_result_block(block, publication_year=None):
     if not isinstance(block, dict):
         return None
-    parsed = _fwci_from_metric_list(block.get("metrics") or [])
+    parsed = _fwci_from_metric_list(block.get("metrics") or [], publication_year)
     if parsed is not None:
         return parsed
     single = block.get("metric")
     if isinstance(single, dict):
-        return _extract_fwci_from_metric(single)
+        return _extract_fwci_from_metric(single, publication_year)
     return None
 
 
-def _parse_fwci_metrics(payload, requested_ids=None):
+def _parse_fwci_metrics(payload, requested_ids=None, publication_year=None):
     """Publication ID -> FWCI from SciVal publication metrics JSON."""
     found = {}
     if not isinstance(payload, dict):
@@ -1258,7 +1327,7 @@ def _parse_fwci_metrics(payload, requested_ids=None):
         blocks = [blocks]
     per_block_values = []
     for block in blocks:
-        fwci_val = _fwci_from_result_block(block)
+        fwci_val = _fwci_from_result_block(block, publication_year)
         per_block_values.append(fwci_val)
         pub_id = _publication_id_from_result_block(block)
         if pub_id and fwci_val is not None:
@@ -1275,9 +1344,14 @@ def _parse_fwci_metrics(payload, requested_ids=None):
             found.setdefault(req_ids[0], per_block_values[0])
 
     if not found and isinstance(payload.get("metrics"), list):
-        top_val = _fwci_from_result_block({"metrics": payload.get("metrics")})
+        top_val = _fwci_from_result_block({"metrics": payload.get("metrics")}, publication_year)
         if top_val is not None and len(req_ids) == 1:
             found[req_ids[0]] = top_val
+    if not found and req_ids:
+        deep_val = _deep_scan_fwci_payload(payload, publication_year)
+        if deep_val is not None:
+            for rid in req_ids:
+                found.setdefault(rid, deep_val)
     return found
 
 
@@ -1293,19 +1367,22 @@ _SCIVAL_FWCI_PARAMS = {
 
 _FWCI_METRIC_FALLBACKS = (
     {"byYear": "false", "yearRange": "5yrs"},
+    {"byYear": "false", "yearRange": "10yrs"},
     {"byYear": "true", "yearRange": "10yrs"},
+    {"byYear": "false", "yearRange": "5yrsAndCurrent"},
+    {"byYear": "true", "yearRange": "5yrsAndCurrent"},
 )
 
 
 def lookup_scopus_publication_id_for_doi(doi, api_key, inst_token):
     """Step 1 for FWCI: DOI → numeric Scopus publication ID (Abstract Retrieval, then Search)."""
-    pub_id, status, body = fetch_scopus_publication_id(doi, api_key, inst_token, view="META")
+    pub_id, pub_year, status, body = fetch_scopus_publication_id(doi, api_key, inst_token, view="META")
     if pub_id:
-        return pub_id, status, body
+        return pub_id, pub_year, status, body
     search_id = _scopus_id_from_search(doi, api_key, inst_token)
     if search_id:
-        return search_id, 200, None
-    return None, status, body
+        return search_id, None, 200, None
+    return None, None, status, body
 
 
 def fetch_fwci_for_publication_ids(
@@ -1318,6 +1395,7 @@ def fetch_fwci_for_publication_ids(
     yearRange=None,
     journalImpactType=None,
     showAsFieldWeighted=None,
+    publication_year=None,
 ):
     """Step 2 for FWCI: SciVal publication/metrics by Scopus publication ID(s)."""
     ids = []
@@ -1362,6 +1440,7 @@ def fetch_fwci_for_publication_ids(
             yearRange=params.get("yearRange"),
             journalImpactType=params.get("journalImpactType"),
             showAsFieldWeighted=params.get("showAsFieldWeighted"),
+            publication_year=publication_year,
         )
     if response.status_code != 200:
         return {}, response.status_code, response.text
@@ -1369,7 +1448,7 @@ def fetch_fwci_for_publication_ids(
         payload = response.json()
     except ValueError:
         return {}, response.status_code, response.text
-    return _parse_fwci_metrics(payload, requested_ids=ids), response.status_code, None
+    return _parse_fwci_metrics(payload, requested_ids=ids, publication_year=publication_year), response.status_code, None
 
 
 def _pick_fwci_from_metrics(metrics, pub_id):
@@ -1388,7 +1467,7 @@ def _pick_fwci_from_metrics(metrics, pub_id):
 
 def fetch_doi_fwci(doi, api_key, inst_token):
     """DOI → Scopus publication ID → SciVal FWCI (Publication Lookup API). Returns (value, status note)."""
-    pub_id, status, body = lookup_scopus_publication_id_for_doi(doi, api_key, inst_token)
+    pub_id, pub_year, status, body = lookup_scopus_publication_id_for_doi(doi, api_key, inst_token)
     if not pub_id:
         if status == 404:
             return "N/A", "No Scopus record for this DOI."
@@ -1406,7 +1485,7 @@ def fetch_doi_fwci(doi, api_key, inst_token):
     for attempt in query_attempts:
         if attempt is None:
             metrics, scival_status, scival_body = fetch_fwci_for_publication_ids(
-                [pub_id], api_key, inst_token
+                [pub_id], api_key, inst_token, publication_year=pub_year
             )
         else:
             metrics, scival_status, scival_body = fetch_fwci_for_publication_ids(
@@ -1415,6 +1494,7 @@ def fetch_doi_fwci(doi, api_key, inst_token):
                 inst_token,
                 byYear=attempt["byYear"],
                 yearRange=attempt["yearRange"],
+                publication_year=pub_year,
             )
         last_scival_status = scival_status
         last_scival_body = scival_body
@@ -1436,10 +1516,11 @@ def fetch_doi_fwci(doi, api_key, inst_token):
     if last_scival_status and last_scival_status != 200:
         return "N/A", api_error_message("Scival", last_scival_status, last_scival_body)
 
+    year_hint = f", publication year {pub_year}" if pub_year else ""
     return (
         "N/A",
-        f"FWCI not returned by SciVal for Scopus publication ID {pub_id}. "
-        f"Try the same ID in Publication Lookup (metricTypes=FieldWeightedCitationImpact, yearRange=5yrs, byYear=true).",
+        f"FWCI empty in SciVal API for publication ID {pub_id}{year_hint}. "
+        f"If Scopus.com shows FWCI, try yearRange=10yrs or byYear=false in Publication Lookup; the weekly API snapshot can lag the website.",
     )
 
 
