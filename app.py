@@ -1104,21 +1104,6 @@ def fetch_scopus_publication_id(doi, api_key, inst_token, _retry_count=0, view="
     return _parse_scopus_publication_id(payload), response.status_code, None
 
 
-def resolve_scopus_publication_ids(doi, api_key, inst_token):
-    """Candidate Scopus publication IDs for one DOI (deduplicated, in try order)."""
-    candidates = []
-    for view in ("META", ""):
-        pub_id, status, _body = fetch_scopus_publication_id(doi, api_key, inst_token, view=view)
-        if pub_id and pub_id not in candidates:
-            candidates.append(pub_id)
-        if status == 429:
-            break
-    search_id = _scopus_id_from_search(doi, api_key, inst_token)
-    if search_id and search_id not in candidates:
-        candidates.append(search_id)
-    return candidates
-
-
 def _coerce_fwci_number(raw):
     """Extract a single FWCI float from SciVal metric value shapes."""
     if raw is None or isinstance(raw, bool):
@@ -1296,12 +1281,31 @@ def _parse_fwci_metrics(payload, requested_ids=None):
     return found
 
 
-_FWCI_METRIC_ATTEMPTS = (
+# SciVal Publication Lookup — matches dev.elsevier.com publicationMetrics defaults.
+_SCIVAL_FWCI_PARAMS = {
+    "metricTypes": "FieldWeightedCitationImpact",
+    "yearRange": "5yrs",
+    "byYear": "true",
+    "includedDocs": "AllPublicationTypes",
+    "journalImpactType": "CiteScore",
+    "showAsFieldWeighted": "false",
+}
+
+_FWCI_METRIC_FALLBACKS = (
     {"byYear": "false", "yearRange": "5yrs"},
-    {"byYear": "true", "yearRange": "5yrs"},
-    {"byYear": "false", "yearRange": "10yrs"},
-    {"byYear": "true", "yearRange": "5yrsAndCurrent"},
+    {"byYear": "true", "yearRange": "10yrs"},
 )
+
+
+def lookup_scopus_publication_id_for_doi(doi, api_key, inst_token):
+    """Step 1 for FWCI: DOI → numeric Scopus publication ID (Abstract Retrieval, then Search)."""
+    pub_id, status, body = fetch_scopus_publication_id(doi, api_key, inst_token, view="META")
+    if pub_id:
+        return pub_id, status, body
+    search_id = _scopus_id_from_search(doi, api_key, inst_token)
+    if search_id:
+        return search_id, 200, None
+    return None, status, body
 
 
 def fetch_fwci_for_publication_ids(
@@ -1310,10 +1314,12 @@ def fetch_fwci_for_publication_ids(
     inst_token,
     _retry_count=0,
     *,
-    byYear="false",
-    yearRange="5yrs",
+    byYear=None,
+    yearRange=None,
+    journalImpactType=None,
+    showAsFieldWeighted=None,
 ):
-    """SciVal Field-Weighted Citation Impact for one or more Scopus publication IDs."""
+    """Step 2 for FWCI: SciVal publication/metrics by Scopus publication ID(s)."""
     ids = []
     for item in publication_ids or []:
         text = str(item or "").strip()
@@ -1322,15 +1328,20 @@ def fetch_fwci_for_publication_ids(
     if not ids:
         return {}, None, "No publication IDs"
     params = {
-        "metricTypes": "FieldWeightedCitationImpact",
+        **_SCIVAL_FWCI_PARAMS,
         "publicationIds": ",".join(ids),
-        "byYear": byYear,
-        "yearRange": yearRange,
-        "includedDocs": "AllPublicationTypes",
         "httpAccept": "application/json",
         "apiKey": api_key,
         "insttoken": inst_token,
     }
+    if byYear is not None:
+        params["byYear"] = byYear
+    if yearRange is not None:
+        params["yearRange"] = yearRange
+    if journalImpactType is not None:
+        params["journalImpactType"] = journalImpactType
+    if showAsFieldWeighted is not None:
+        params["showAsFieldWeighted"] = showAsFieldWeighted
     try:
         response = requests.get(
             "https://api.elsevier.com/analytics/scival/publication/metrics",
@@ -1347,8 +1358,10 @@ def fetch_fwci_for_publication_ids(
             api_key,
             inst_token,
             _retry_count + 1,
-            byYear=byYear,
-            yearRange=yearRange,
+            byYear=params.get("byYear"),
+            yearRange=params.get("yearRange"),
+            journalImpactType=params.get("journalImpactType"),
+            showAsFieldWeighted=params.get("showAsFieldWeighted"),
         )
     if response.status_code != 200:
         return {}, response.status_code, response.text
@@ -1374,10 +1387,9 @@ def _pick_fwci_from_metrics(metrics, pub_id):
 
 
 def fetch_doi_fwci(doi, api_key, inst_token):
-    """Independent SciVal FWCI lookup for a DOI. Returns (display value, status note)."""
-    pub_ids = resolve_scopus_publication_ids(doi, api_key, inst_token)
-    if not pub_ids:
-        pub_id, status, body = fetch_scopus_publication_id(doi, api_key, inst_token)
+    """DOI → Scopus publication ID → SciVal FWCI (Publication Lookup API). Returns (value, status note)."""
+    pub_id, status, body = lookup_scopus_publication_id_for_doi(doi, api_key, inst_token)
+    if not pub_id:
         if status == 404:
             return "N/A", "No Scopus record for this DOI."
         if status in (401, 403):
@@ -1388,10 +1400,15 @@ def fetch_doi_fwci(doi, api_key, inst_token):
             return "N/A", f"Scopus ID lookup failed: {body}"
         return "N/A", "Could not resolve a Scopus publication ID for this DOI."
 
+    query_attempts = (None,) + _FWCI_METRIC_FALLBACKS
     last_scival_status = None
     last_scival_body = None
-    for pub_id in pub_ids:
-        for attempt in _FWCI_METRIC_ATTEMPTS:
+    for attempt in query_attempts:
+        if attempt is None:
+            metrics, scival_status, scival_body = fetch_fwci_for_publication_ids(
+                [pub_id], api_key, inst_token
+            )
+        else:
             metrics, scival_status, scival_body = fetch_fwci_for_publication_ids(
                 [pub_id],
                 api_key,
@@ -1399,19 +1416,18 @@ def fetch_doi_fwci(doi, api_key, inst_token):
                 byYear=attempt["byYear"],
                 yearRange=attempt["yearRange"],
             )
-            last_scival_status = scival_status
-            last_scival_body = scival_body
-            if scival_status in (401, 403, 429):
-                break
-            if scival_status and scival_status != 200:
-                continue
-            value = _pick_fwci_from_metrics(metrics, pub_id)
-            if value is not None:
-                text = f"{value:.3f}".rstrip("0").rstrip(".")
-                return text, ""
-            time.sleep(0.15)
-        if last_scival_status in (401, 403, 429):
+        last_scival_status = scival_status
+        last_scival_body = scival_body
+        if scival_status in (401, 403, 429):
             break
+        if scival_status and scival_status != 200:
+            continue
+        value = _pick_fwci_from_metrics(metrics, pub_id)
+        if value is not None:
+            text = f"{value:.3f}".rstrip("0").rstrip(".")
+            return text, ""
+        if attempt is not None:
+            time.sleep(0.15)
 
     if last_scival_status in (401, 403):
         return "N/A", api_error_message("Scival", last_scival_status, last_scival_body)
@@ -1420,11 +1436,10 @@ def fetch_doi_fwci(doi, api_key, inst_token):
     if last_scival_status and last_scival_status != 200:
         return "N/A", api_error_message("Scival", last_scival_status, last_scival_body)
 
-    id_hint = ", ".join(pub_ids[:3])
     return (
         "N/A",
-        f"FWCI not returned by SciVal for Scopus ID(s) {id_hint}. "
-        "Check the same ID(s) in the Publication Lookup API; the Scopus page can show FWCI before the weekly SciVal API refresh.",
+        f"FWCI not returned by SciVal for Scopus publication ID {pub_id}. "
+        f"Try the same ID in Publication Lookup (metricTypes=FieldWeightedCitationImpact, yearRange=5yrs, byYear=true).",
     )
 
 
