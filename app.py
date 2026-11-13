@@ -1056,7 +1056,108 @@ def fetch_scopus_publication_id(doi, api_key, inst_token, _retry_count=0):
     return _parse_scopus_publication_id(payload), response.status_code, None
 
 
-def _parse_fwci_metrics(payload):
+def _coerce_fwci_number(raw):
+    """Extract a single FWCI float from SciVal metric value shapes."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    if isinstance(raw, dict):
+        if not raw:
+            return None
+        direct = raw.get("value")
+        if direct is not None:
+            parsed = _coerce_fwci_number(direct)
+            if parsed is not None:
+                return parsed
+        vby = raw.get("valueByYear") or raw.get("valuesByYear")
+        if isinstance(vby, dict) and vby:
+            ordered = sorted(vby.items(), key=lambda item: str(item[0]))
+            for _, year_val in reversed(ordered):
+                parsed = _coerce_fwci_number(year_val)
+                if parsed is not None:
+                    return parsed
+        for key in ("total", "overall", "default"):
+            if key in raw:
+                parsed = _coerce_fwci_number(raw[key])
+                if parsed is not None:
+                    return parsed
+        return None
+    if isinstance(raw, list):
+        for item in raw:
+            parsed = _coerce_fwci_number(item)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _publication_id_from_result_block(block):
+    """Scopus publication id from a SciVal result block, if present."""
+    if not isinstance(block, dict):
+        return None
+    for key in ("publicationId", "id", "entityId", "scopusId"):
+        text = str(block.get(key) or "").strip()
+        if text:
+            match = re.search(r"(\d{8,})", text)
+            if match:
+                return match.group(1)
+    link = block.get("link")
+    if isinstance(link, list):
+        link = link[0] if link else None
+    if isinstance(link, dict):
+        for field in ("@ref", "@href", "href", "ref"):
+            text = str(link.get(field) or "")
+            match = re.search(r"(\d{8,})", text)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _extract_fwci_from_metric(metric):
+    if not isinstance(metric, dict):
+        return None
+    mtype = (metric.get("metricType") or metric.get("type") or "").strip()
+    if mtype == "FieldWeightedCitationImpact":
+        return (
+            _coerce_fwci_number(metric.get("value"))
+            or _coerce_fwci_number(metric.get("valueByYear"))
+            or _coerce_fwci_number(metric.get("values"))
+        )
+    nested = metric.get("FieldWeightedCitationImpact")
+    if nested is not None:
+        if isinstance(nested, dict):
+            return _extract_fwci_from_metric(nested) or _coerce_fwci_number(nested)
+        return _coerce_fwci_number(nested)
+    return None
+
+
+def _fwci_from_result_block(block):
+    if not isinstance(block, dict):
+        return None
+    metrics = block.get("metrics") or []
+    if isinstance(metrics, dict):
+        metrics = [metrics]
+    for metric in metrics:
+        parsed = _extract_fwci_from_metric(metric)
+        if parsed is not None:
+            return parsed
+    single = block.get("metric")
+    if isinstance(single, dict):
+        parsed = _extract_fwci_from_metric(single)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_fwci_metrics(payload, requested_ids=None):
     """Publication ID -> FWCI from SciVal publication metrics JSON."""
     found = {}
     if not isinstance(payload, dict):
@@ -1064,31 +1165,28 @@ def _parse_fwci_metrics(payload):
     blocks = payload.get("results") or payload.get("result") or []
     if isinstance(blocks, dict):
         blocks = [blocks]
+    per_block_values = []
     for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        pub_id = str(block.get("publicationId") or block.get("id") or "").strip()
-        metrics = block.get("metrics") or []
-        if isinstance(metrics, dict):
-            metrics = [metrics]
-        for metric in metrics:
-            if not isinstance(metric, dict):
+        fwci_val = _fwci_from_result_block(block)
+        per_block_values.append(fwci_val)
+        pub_id = _publication_id_from_result_block(block)
+        if pub_id and fwci_val is not None:
+            found[str(pub_id)] = fwci_val
+
+    req_ids = [str(i).strip() for i in (requested_ids or []) if str(i).strip()]
+    if req_ids:
+        for index, rid in enumerate(req_ids):
+            if rid in found or found.get(rid.lstrip("0")):
                 continue
-            mtype = (metric.get("metricType") or metric.get("type") or "").strip()
-            if mtype != "FieldWeightedCitationImpact":
-                continue
-            try:
-                found[pub_id] = float(metric.get("value"))
-            except (TypeError, ValueError):
-                pass
-            break
-        metric = block.get("metric")
-        if pub_id and pub_id not in found and isinstance(metric, dict):
-            if (metric.get("metricType") or "").strip() == "FieldWeightedCitationImpact":
-                try:
-                    found[pub_id] = float(metric.get("value"))
-                except (TypeError, ValueError):
-                    pass
+            if index < len(per_block_values) and per_block_values[index] is not None:
+                found[rid] = per_block_values[index]
+        if len(req_ids) == 1 and len(per_block_values) == 1 and per_block_values[0] is not None:
+            found.setdefault(req_ids[0], per_block_values[0])
+
+    if not found and isinstance(payload.get("metrics"), list):
+        top_val = _fwci_from_result_block({"metrics": payload.get("metrics")})
+        if top_val is not None and len(req_ids) == 1:
+            found[req_ids[0]] = top_val
     return found
 
 
@@ -1104,7 +1202,7 @@ def fetch_fwci_for_publication_ids(publication_ids, api_key, inst_token, _retry_
     params = {
         "metricTypes": "FieldWeightedCitationImpact",
         "publicationIds": ",".join(ids),
-        "byYear": "false",
+        "byYear": True,
         "yearRange": "5yrs",
         "includedDocs": "AllPublicationTypes",
         "apiKey": api_key,
@@ -1127,7 +1225,7 @@ def fetch_fwci_for_publication_ids(publication_ids, api_key, inst_token, _retry_
         payload = response.json()
     except ValueError:
         return {}, response.status_code, response.text
-    return _parse_fwci_metrics(payload), response.status_code, None
+    return _parse_fwci_metrics(payload, requested_ids=ids), response.status_code, None
 
 
 def fetch_doi_fwci(doi, api_key, inst_token):
