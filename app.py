@@ -5651,15 +5651,15 @@ elif app_mode == "Scopus":
                     if include_fwci:
                         export_cols.append("FWCI")
                     if scopus_scival_details:
-                            export_cols.extend(
-                                [
-                                    "SciVal Year",
-                                    "SciVal Type",
-                                    "SciVal Source",
-                                    "SciVal Topic",
-                                    "SciVal Topic cluster",
-                                ]
-                            )
+                        export_cols.extend(
+                            [
+                                "SciVal Year",
+                                "SciVal Type",
+                                "SciVal Source",
+                                "SciVal Topic",
+                                "SciVal Topic cluster",
+                            ]
+                        )
                     if scopus_scival_sdg:
                         export_cols.append("SciVal SDGs")
                     export_cols.append("Status")
