@@ -20,6 +20,8 @@ from fwci_lib import (
     fetch_doi_scival,
     fetch_doi_fwci,
     format_fwci_status,
+    scopus_id_year_from_citations_payload,
+    _coerce_year,
     _extract_publication_meta,
     _scival_optional_row_columns,
     _fwci_help_text,
@@ -27,12 +29,20 @@ from fwci_lib import (
 )
 
 
-def fetch_doi_scival_cached(doi, api_key, inst_token):
+def fetch_doi_scival_cached(
+    doi, api_key, inst_token, publication_id=None, publication_year=None
+):
     """Per-session cache so duplicate DOIs in one run only hit SciVal once."""
     cache = st.session_state.setdefault("_scival_doi_cache", {})
-    key = str(doi or "").strip().lower()
+    key = f"{str(doi or '').strip().lower()}|{publication_id or ''}|{publication_year or ''}"
     if key not in cache:
-        cache[key] = fetch_doi_scival(doi, api_key, inst_token)
+        cache[key] = fetch_doi_scival(
+            doi,
+            api_key,
+            inst_token,
+            publication_id=publication_id,
+            publication_year=publication_year,
+        )
     return cache[key]
 
 
@@ -976,6 +986,7 @@ def process_doi_scopus(doi, api_key, inst_token):
     """Processes a single DOI to get both metadata and citation metrics."""
     try:
         data_total = fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False)
+        scopus_pub_id, scopus_pub_year = scopus_id_year_from_citations_payload(data_total)
         cite_header = data_total.get("abstract-citations-response", {}).get("citeColumnTotalXML", {}).get("citeCountHeader", {})
         total_citations = cite_header.get("grandTotal", 0)
         cite_info = data_total.get("abstract-citations-response", {}).get("citeInfoMatrix", {}).get("citeInfoMatrixXML", {}).get("citationMatrix", {}).get("citeInfo", [])
@@ -999,6 +1010,8 @@ def process_doi_scopus(doi, api_key, inst_token):
             "Total Citations": total_citations,
             "Exclude self-citations": exclude_self_citations,
             "Status": "Success",
+            "_scopus_pub_id": scopus_pub_id,
+            "_scopus_pub_year": scopus_pub_year or _coerce_year(year),
         }
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else None
@@ -4621,6 +4634,7 @@ if app_mode == "Unified citation search":
                             row["FWCI Status"] = "N/A"
                         row.update(_scival_optional_row_columns(None, unified_scival_details, unified_scival_sdg))
                     effective_doi = doi if doi and str(doi).startswith("10.") else None
+                    scopus_bundle = {}
                     if _wos_ok and effective_doi:
                         status_text.text(f"WOS: {user_id[:50]}...")
                         wos_list = fetch_wos_data([effective_doi], progress_bar, status_text, wos_api_key=WOS_API_KEY)
@@ -4635,6 +4649,7 @@ if app_mode == "Unified citation search":
                         status_text.text(f"Scopus: {user_id[:50]}...")
                         try:
                             s = process_doi_scopus(effective_doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                            scopus_bundle = s
                             row["Title"] = row["Title"] if row["Title"] != "N/A" else s.get("Title", "N/A")
                             row["Scopus Total Citations"] = s.get("Total Citations", "N/A")
                             row["Scopus Excl. self"] = s.get("Exclude self-citations", "N/A")
@@ -4648,7 +4663,11 @@ if app_mode == "Unified citation search":
                         status_text.text(f"SciVal: {user_id[:50]}...")
                         try:
                             scival = fetch_doi_scival_cached(
-                                effective_doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN
+                                effective_doi,
+                                SCOPUS_API_KEY,
+                                SCOPUS_INST_TOKEN,
+                                publication_id=scopus_bundle.get("_scopus_pub_id"),
+                                publication_year=scopus_bundle.get("_scopus_pub_year"),
                             )
                             if unified_include_fwci:
                                 row["Scopus FWCI"] = scival.get("fwci", "N/A")
@@ -5041,7 +5060,13 @@ elif app_mode == "Scopus":
                                 _scival_optional_row_columns(None, scopus_scival_details, scopus_scival_sdg)
                             )
                             try:
-                                scival = fetch_doi_scival_cached(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                                scival = fetch_doi_scival_cached(
+                                    doi,
+                                    SCOPUS_API_KEY,
+                                    SCOPUS_INST_TOKEN,
+                                    publication_id=result.get("_scopus_pub_id"),
+                                    publication_year=result.get("_scopus_pub_year"),
+                                )
                                 if include_fwci:
                                     result["FWCI"] = scival.get("fwci", "N/A")
                                     result["FWCI Status"] = format_fwci_status(scival, include_fwci=True)
@@ -5061,6 +5086,9 @@ elif app_mode == "Scopus":
                         progress_bar.progress((i + 1) / len(all_dois))
                         time.sleep(sleep_time)
                     status_text.success(f"✅ Finished processing {len(results_list)} records!")
+                    for row in results_list:
+                        row.pop("_scopus_pub_id", None)
+                        row.pop("_scopus_pub_year", None)
                     df_results = pd.DataFrame(results_list)
                     export_cols = ["DOI", "Title", "Year", "Total Citations", "Exclude self-citations"]
                     if include_fwci:
