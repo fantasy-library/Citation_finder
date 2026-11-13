@@ -1164,6 +1164,16 @@ def _coerce_fwci_number(raw):
     return None
 
 
+def _year_from_metric_key(key):
+    match = re.search(r"(\d{4})", str(key))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
 def _fwci_from_value_by_year(raw, publication_year=None):
     """Pick FWCI from SciVal valueByYear; prefer the document's publication year."""
     if raw is None:
@@ -1171,11 +1181,34 @@ def _fwci_from_value_by_year(raw, publication_year=None):
     if not isinstance(raw, dict):
         return _coerce_fwci_number(raw)
     if publication_year is not None:
+        target = int(publication_year)
+        for ykey, yval in raw.items():
+            parsed = _coerce_fwci_number(yval)
+            if parsed is None:
+                continue
+            year = _year_from_metric_key(ykey)
+            if year == target:
+                return parsed
         for ykey in (publication_year, str(publication_year)):
             if ykey in raw:
                 parsed = _coerce_fwci_number(raw[ykey])
                 if parsed is not None:
                     return parsed
+        closest = None
+        closest_gap = None
+        for ykey, yval in raw.items():
+            year = _year_from_metric_key(ykey)
+            if year is None:
+                continue
+            parsed = _coerce_fwci_number(yval)
+            if parsed is None:
+                continue
+            gap = abs(year - target)
+            if closest_gap is None or gap < closest_gap:
+                closest_gap = gap
+                closest = parsed
+        if closest is not None and closest_gap is not None and closest_gap <= 2:
+            return closest
     for ykey in sorted(raw.keys(), key=lambda k: str(k), reverse=True):
         parsed = _coerce_fwci_number(raw[ykey])
         if parsed is not None:
@@ -1366,27 +1399,130 @@ _SCIVAL_FWCI_PARAMS = {
     "showAsFieldWeighted": "false",
 }
 
-# Older publication years often need byYear=true + valueByYear (aggregate byYear=false can be empty).
-_FWCI_METRIC_ATTEMPTS = (
-    None,  # default: 10yrs, byYear=false
-    {"byYear": "true", "yearRange": "10yrs"},
-    {"byYear": "true", "yearRange": "5yrs"},
-    {"byYear": "false", "yearRange": "5yrs"},
-    {"byYear": "true", "yearRange": "5yrsAndCurrent"},
-    {"byYear": "false", "yearRange": "5yrsAndCurrent"},
+_FWCI_YEAR_RANGES = (
+    "10yrs",
+    "5yrs",
+    "5yrsAndCurrent",
+    "3yrs",
+    "3yrsAndCurrent",
 )
+
+
+def _build_fwci_query_attempts(publication_year=None):
+    """Order SciVal metric queries to maximize FWCI match rate."""
+    by_true = [{"byYear": "true", "yearRange": yr} for yr in _FWCI_YEAR_RANGES]
+    by_false = [{"byYear": "false", "yearRange": yr} for yr in _FWCI_YEAR_RANGES]
+    if publication_year is not None and publication_year < 2016:
+        return by_true + [None] + by_false
+    return [None] + by_true + by_false[:2]
+
+
+def _collect_fwci_candidates(payload):
+    """All numeric FWCI candidates from a SciVal metrics payload."""
+    found = []
+    seen = set()
+
+    def _add(value, source):
+        num = _coerce_fwci_number(value)
+        if num is None:
+            return
+        key = (round(num, 8), source)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append((num, source))
+
+    if not isinstance(payload, dict):
+        return found
+
+    blocks = payload.get("results") or []
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        metrics = block.get("metrics") or []
+        if isinstance(metrics, dict):
+            metrics = [metrics]
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                continue
+            mtype = (metric.get("metricType") or metric.get("type") or metric.get("@type") or "").strip()
+            if mtype and mtype != "FieldWeightedCitationImpact":
+                continue
+            if metric.get("value") is not None:
+                _add(metric.get("value"), "aggregate")
+            vby = metric.get("valueByYear") or {}
+            if isinstance(vby, dict):
+                for year_key, year_val in vby.items():
+                    _add(year_val, f"year:{year_key}")
+            values = metric.get("values")
+            if isinstance(values, list):
+                for item in values:
+                    if isinstance(item, dict):
+                        if item.get("value") is not None:
+                            _add(item.get("value"), "aggregate-nested")
+                        nested_vby = item.get("valueByYear") or {}
+                        if isinstance(nested_vby, dict):
+                            for year_key, year_val in nested_vby.items():
+                                _add(year_val, f"year:{year_key}")
+                    else:
+                        _add(item, "values-list")
+
+    deep = _deep_scan_fwci_payload(payload, None)
+    if deep is not None:
+        _add(deep, "deep-scan")
+    return found
+
+
+def _score_fwci_candidate(source, publication_year=None):
+    """Higher score = better match to the paper's cohort FWCI."""
+    if publication_year is None:
+        return 50 if source == "aggregate" else 30
+    if str(source).startswith("year:"):
+        year = _year_from_metric_key(source.split(":", 1)[1])
+        if year is None:
+            return 35
+        if year == int(publication_year):
+            return 100
+        gap = abs(year - int(publication_year))
+        if gap == 1:
+            return 92
+        if gap <= 3:
+            return 80 - gap * 5
+        return max(10, 60 - gap)
+    if source == "aggregate":
+        return 78 if int(publication_year) >= 2016 else 45
+    return 40
+
+
+def _best_fwci_from_payload(payload, publication_year=None):
+    candidates = _collect_fwci_candidates(payload)
+    if not candidates:
+        return None, -1
+    best_val = None
+    best_score = -1
+    for num, source in candidates:
+        score = _score_fwci_candidate(source, publication_year)
+        if score > best_score:
+            best_score = score
+            best_val = num
+    return best_val, best_score
 
 
 def _fwci_value_from_response(metrics, payload, pub_id, publication_year=None):
     """Resolve FWCI from parsed metrics map or raw SciVal payload."""
     value = _pick_fwci_from_metrics(metrics, pub_id)
     if value is not None:
-        return value
+        return value, _score_fwci_candidate("aggregate", publication_year)
     if not payload:
-        return None
+        return None, -1
+    best, score = _best_fwci_from_payload(payload, publication_year)
+    if best is not None:
+        return best, score
     value = _deep_scan_fwci_payload(payload, publication_year)
     if value is not None:
-        return value
+        return value, 45
     blocks = (payload.get("results") or []) if isinstance(payload, dict) else []
     if isinstance(blocks, dict):
         blocks = [blocks]
@@ -1395,8 +1531,8 @@ def _fwci_value_from_response(metrics, payload, pub_id, publication_year=None):
             continue
         value = _fwci_from_result_block(block, publication_year)
         if value is not None:
-            return value
-    return None
+            return value, 50
+    return None, -1
 
 
 def _refresh_publication_year_from_payload(payload, pub_id, pub_year):
@@ -1590,17 +1726,14 @@ def fetch_doi_scival(doi, api_key, inst_token):
             note = f"Scopus ID lookup failed: {body}"
         return {"fwci": "N/A", "note": note, "publication": None}
 
-    # Pre-2016 papers: try byYear=true first so valueByYear can supply the publication-year FWCI.
-    if pub_year and pub_year < 2016:
-        query_attempts = (
-            {"byYear": "true", "yearRange": "10yrs"},
-        ) + _FWCI_METRIC_ATTEMPTS
-    else:
-        query_attempts = _FWCI_METRIC_ATTEMPTS
-
+    query_attempts = _build_fwci_query_attempts(pub_year)
     last_scival_status = None
     last_scival_body = None
     last_payload = None
+    best_value = None
+    best_score = -1
+    best_publication = None
+
     for index, attempt in enumerate(query_attempts):
         if attempt is None:
             metrics, scival_status, scival_body, payload = fetch_fwci_for_publication_ids(
@@ -1620,17 +1753,26 @@ def fetch_doi_scival(doi, api_key, inst_token):
         if payload:
             last_payload = payload
             pub_year = _refresh_publication_year_from_payload(payload, pub_id, pub_year)
+            best_publication = _extract_publication_meta(payload, pub_id) or best_publication
         if scival_status in (401, 403, 429):
             break
         if scival_status and scival_status != 200:
             continue
-        value = _fwci_value_from_response(metrics, payload, pub_id, pub_year)
-        if value is not None:
-            text = f"{value:.3f}".rstrip("0").rstrip(".")
-            publication = _extract_publication_meta(payload or last_payload, pub_id)
-            return {"fwci": text, "note": "", "publication": publication}
+        value, score = _fwci_value_from_response(metrics, payload, pub_id, pub_year)
+        if value is not None and score > best_score:
+            best_value = value
+            best_score = score
+        if best_score >= 92:
+            break
         if index < len(query_attempts) - 1:
-            time.sleep(0.12)
+            time.sleep(0.1)
+
+    if best_value is not None:
+        text = f"{best_value:.3f}".rstrip("0").rstrip(".")
+        publication = best_publication or (
+            _extract_publication_meta(last_payload, pub_id) if last_payload else None
+        )
+        return {"fwci": text, "note": "", "publication": publication}
 
     publication = _extract_publication_meta(last_payload, pub_id) if last_payload else None
     if last_scival_status in (401, 403):
