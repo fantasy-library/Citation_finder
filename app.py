@@ -1202,9 +1202,10 @@ def fetch_fwci_for_publication_ids(publication_ids, api_key, inst_token, _retry_
     params = {
         "metricTypes": "FieldWeightedCitationImpact",
         "publicationIds": ",".join(ids),
-        "byYear": True,
+        "byYear": "true",
         "yearRange": "5yrs",
         "includedDocs": "AllPublicationTypes",
+        "httpAccept": "application/json",
         "apiKey": api_key,
         "insttoken": inst_token,
     }
@@ -1212,6 +1213,7 @@ def fetch_fwci_for_publication_ids(publication_ids, api_key, inst_token, _retry_
         response = requests.get(
             "https://api.elsevier.com/analytics/scival/publication/metrics",
             params=params,
+            headers={"Accept": "application/json"},
             timeout=30,
         )
     except requests.RequestException as exc:
