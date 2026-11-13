@@ -48,6 +48,19 @@ class FwciParserTests(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
         self.assertEqual(attempts[0], {"byYear": "true", "yearRange": "5yrs"})
 
+    def test_collect_multiple_sdgs(self):
+        publication = {
+            "sdg": [
+                "SDG 3: Good Health and Well-being",
+                "SDG 16: Peace, Justice and Strong Institutions",
+            ]
+        }
+        self.assertEqual(len(lib._collect_publication_sdgs(publication)), 2)
+        cols = lib._scival_optional_row_columns(publication, include_sdg=True)
+        self.assertIn("SDG 3", cols["SciVal SDGs"])
+        self.assertIn("SDG 16", cols["SciVal SDGs"])
+        self.assertIn(";", cols["SciVal SDGs"])
+
 
 if __name__ == "__main__":
     unittest.main()

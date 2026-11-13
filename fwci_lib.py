@@ -826,6 +826,78 @@ def _extract_publication_meta(payload, pub_id):
     return matched or fallback
 
 
+def _sdg_label(item):
+    if item is None:
+        return None
+    if isinstance(item, str):
+        text = item.strip()
+        return text or None
+    if isinstance(item, dict):
+        for key in ("name", "title", "label", "sdg", "value", "@value"):
+            text = str(item.get(key) or "").strip()
+            if text:
+                return text
+        sid = item.get("id")
+        if sid is not None:
+            return f"SDG {sid}"
+    return str(item).strip() or None
+
+
+def _collect_publication_sdgs(publication):
+    """All SDG tags from SciVal publication JSON (list, string, or nested objects)."""
+    if not isinstance(publication, dict):
+        return []
+    raw = publication.get("sdg")
+    if raw is None:
+        raw = publication.get("sdgs")
+    if raw is None:
+        return []
+
+    items = []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        if re.search(r";\s*SDG|;\s*\d", text, re.I) or " | " in text:
+            parts = re.split(r"\s*[;|]\s*", text)
+            items.extend(parts)
+        else:
+            items.append(text)
+    elif isinstance(raw, dict):
+        nested = raw.get("sdg") or raw.get("items") or raw.get("value")
+        if nested is not None:
+            items.extend(_collect_publication_sdgs({"sdg": nested}))
+        else:
+            label = _sdg_label(raw)
+            if label:
+                items.append(label)
+    elif isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict) and ("sdg" in entry or "sdgs" in entry):
+                items.extend(_collect_publication_sdgs(entry))
+            else:
+                label = _sdg_label(entry)
+                if label:
+                    items.append(label)
+    else:
+        label = _sdg_label(raw)
+        if label:
+            items.append(label)
+
+    seen = set()
+    unique = []
+    for text in items:
+        clean = str(text).strip()
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(clean)
+    return unique
+
+
 def _scival_optional_row_columns(publication, include_details=False, include_sdg=False):
     """Optional export columns from SciVal publication metadata (no extra API calls)."""
     cols = {}
@@ -852,11 +924,8 @@ def _scival_optional_row_columns(publication, include_details=False, include_sdg
             ):
                 cols[name] = "N/A"
     if include_sdg:
-        if isinstance(publication, dict):
-            sdgs = publication.get("sdg") or []
-            cols["SciVal SDGs"] = "; ".join(str(s) for s in sdgs) if sdgs else "N/A"
-        else:
-            cols["SciVal SDGs"] = "N/A"
+        sdgs = _collect_publication_sdgs(publication)
+        cols["SciVal SDGs"] = "; ".join(sdgs) if sdgs else "N/A"
     return cols
 
 
