@@ -1,4 +1,9 @@
-"""SciVal FWCI helpers (shared by app and CLI bulk check)."""
+"""SciVal FWCI helpers (shared by app and CLI bulk check).
+
+Publication-level FWCI uses GET /analytics/scival/publication/metrics with
+metricTypes=FieldWeightedCitationImpact (Elsevier Publication Lookup API).
+Spec: https://dev.elsevier.com/documentation/SciValPublicationAPI.wadl
+"""
 import re
 import time
 from urllib.parse import quote
@@ -27,7 +32,7 @@ def scival_api_error_message(service, status_code, response_body=None):
     return f"Request failed (HTTP {status_code}). Try again later."
 
 
-_FWCI_MAX_QUERY_ATTEMPTS = 8
+_FWCI_MAX_QUERY_ATTEMPTS = 10
 
 
 def _elsevier_headers(api_key, inst_token):
@@ -359,6 +364,10 @@ def _extract_fwci_from_metric(metric, publication_year=None):
         return None
     mtype = (metric.get("metricType") or metric.get("type") or metric.get("@type") or "").strip()
     if mtype == "FieldWeightedCitationImpact":
+        if publication_year is not None:
+            parsed = _fwci_from_value_by_year(metric.get("valueByYear"), publication_year)
+            if parsed is not None:
+                return parsed
         parsed = (
             _coerce_fwci_number(metric.get("value"))
             or _fwci_from_value_by_year(metric.get("valueByYear"), publication_year)
@@ -373,6 +382,10 @@ def _extract_fwci_from_metric(metric, publication_year=None):
                 item_type = (item.get("metricType") or item.get("type") or mtype or "").strip()
                 if item_type and item_type != "FieldWeightedCitationImpact":
                     continue
+                if publication_year is not None:
+                    parsed = _fwci_from_value_by_year(item.get("valueByYear"), publication_year)
+                    if parsed is not None:
+                        return parsed
                 parsed = (
                     _coerce_fwci_number(item.get("value"))
                     or _fwci_from_value_by_year(item.get("valueByYear"), publication_year)
@@ -505,28 +518,36 @@ _SCIVAL_FWCI_PARAMS = {
     "journalImpactType": "CiteScore",
 }
 
-_FWCI_YEAR_RANGES = (
-    "5yrs",
-    "10yrs",
-    "5yrsAndCurrent",
-    "5yrsAndCurrentAndFuture",
-    "3yrs",
-    "3yrsAndCurrent",
+_FWCI_QUERY_COMBOS = (
+    {"byYear": "true", "yearRange": "5yrs"},
+    {"byYear": "true", "yearRange": "10yrs"},
+    {"byYear": "false", "yearRange": "10yrs"},
+    {"byYear": "true", "yearRange": "5yrsAndCurrent"},
+    {"byYear": "true", "yearRange": "5yrsAndCurrentAndFuture"},
+    {"byYear": "true", "yearRange": "3yrs"},
+    {"byYear": "true", "yearRange": "3yrsAndCurrent"},
+    {"byYear": "true", "yearRange": "3yrsAndCurrentAndFuture"},
+    {"byYear": "false", "yearRange": "5yrs"},
+    {"byYear": "false", "yearRange": "5yrsAndCurrent"},
 )
 
 
 def _build_fwci_query_attempts(publication_year=None):
-    """Order SciVal metric queries to maximize FWCI match rate."""
-    by_true = [{"byYear": "true", "yearRange": yr} for yr in _FWCI_YEAR_RANGES]
-    by_false = [{"byYear": "false", "yearRange": yr} for yr in _FWCI_YEAR_RANGES]
-    pinned = [
-        {"byYear": "true", "yearRange": "5yrs"},
-        {"byYear": "true", "yearRange": "10yrs"},
-        {"byYear": "false", "yearRange": "10yrs"},
-    ]
+    """Unique (byYear, yearRange) attempts, OpenAPI-aligned defaults first."""
+    ordered = list(_FWCI_QUERY_COMBOS)
     if publication_year is not None and publication_year < 2016:
-        return pinned + by_true + [None] + by_false[:3]
-    return pinned + [None] + by_true[2:] + by_false[:2]
+        true_first = [c for c in ordered if c["byYear"] == "true"]
+        false_rest = [c for c in ordered if c["byYear"] == "false"]
+        ordered = true_first + false_rest
+    seen = set()
+    unique = []
+    for combo in ordered:
+        key = (combo["byYear"], combo["yearRange"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(combo)
+    return unique
 
 
 def _collect_fwci_candidates(payload):
@@ -737,6 +758,7 @@ def fetch_fwci_for_publication_ids(
             journalImpactType=params.get("journalImpactType"),
             showAsFieldWeighted=params.get("showAsFieldWeighted"),
             publication_year=publication_year,
+            includedDocs=params.get("includedDocs"),
         )
     if response.status_code != 200:
         return {}, response.status_code, response.text, None
@@ -746,6 +768,38 @@ def fetch_fwci_for_publication_ids(
         return {}, response.status_code, response.text, None
     metrics = _parse_fwci_metrics(payload, requested_ids=ids, publication_year=publication_year)
     return metrics, response.status_code, None, payload
+
+
+def fetch_scival_publication_record(pub_id, api_key, inst_token):
+    """GET /publication/{id} — metadata when metrics response has no publication block."""
+    text = str(pub_id or "").strip()
+    if not text:
+        return None
+    url = f"https://api.elsevier.com/analytics/scival/publication/{text}"
+    params = {
+        "apiKey": api_key,
+        "insttoken": inst_token,
+        "httpAccept": "application/json",
+    }
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=_elsevier_headers(api_key, inst_token),
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pub = payload.get("publication")
+    return pub if isinstance(pub, dict) else None
 
 
 def _extract_publication_meta(payload, pub_id):
@@ -905,19 +959,14 @@ def fetch_doi_scival(doi, api_key, inst_token, publication_id=None, publication_
     best_publication = None
 
     for index, attempt in enumerate(query_attempts):
-        if attempt is None:
-            metrics, scival_status, scival_body, payload = fetch_fwci_for_publication_ids(
-                [pub_id], api_key, inst_token, publication_year=pub_year
-            )
-        else:
-            metrics, scival_status, scival_body, payload = fetch_fwci_for_publication_ids(
-                [pub_id],
-                api_key,
-                inst_token,
-                byYear=attempt["byYear"],
-                yearRange=attempt["yearRange"],
-                publication_year=pub_year,
-            )
+        metrics, scival_status, scival_body, payload = fetch_fwci_for_publication_ids(
+            [pub_id],
+            api_key,
+            inst_token,
+            byYear=attempt["byYear"],
+            yearRange=attempt["yearRange"],
+            publication_year=pub_year,
+        )
         last_scival_status = scival_status
         last_scival_body = scival_body
         if payload:
@@ -959,14 +1008,23 @@ def fetch_doi_scival(doi, api_key, inst_token, publication_id=None, publication_
                     best_score = score
                     break
 
+    def _publication_meta():
+        pub = best_publication or (_extract_publication_meta(last_payload, pub_id) if last_payload else None)
+        if pub is None and pub_id:
+            pub = fetch_scival_publication_record(pub_id, api_key, inst_token)
+        return pub
+
     if best_value is not None:
         text = f"{best_value:.3f}".rstrip("0").rstrip(".")
-        publication = best_publication or (
-            _extract_publication_meta(last_payload, pub_id) if last_payload else None
-        )
-        return {"fwci": text, "note": "", "publication": publication, "pub_id": pub_id, "match_score": best_score}
+        return {
+            "fwci": text,
+            "note": "",
+            "publication": _publication_meta(),
+            "pub_id": pub_id,
+            "match_score": best_score,
+        }
 
-    publication = _extract_publication_meta(last_payload, pub_id) if last_payload else None
+    publication = _publication_meta()
     if last_scival_status in (401, 403):
         return {"fwci": "N/A", "note": scival_api_error_message("Scival", last_scival_status, last_scival_body), "publication": publication, "pub_id": pub_id, "match_score": best_score}
     if last_scival_status == 429:
@@ -975,14 +1033,21 @@ def fetch_doi_scival(doi, api_key, inst_token, publication_id=None, publication_
         return {"fwci": "N/A", "note": scival_api_error_message("Scival", last_scival_status, last_scival_body), "publication": publication, "pub_id": pub_id, "match_score": best_score}
 
     year_hint = f" (publication year {pub_year})" if pub_year else ""
+    window_hint = ""
+    if isinstance(last_payload, dict):
+        ds = last_payload.get("dataSource") or {}
+        start = ds.get("metricStartYear")
+        end = ds.get("metricEndYear")
+        if start is not None and end is not None:
+            window_hint = f" SciVal metric window {start}–{end}."
     api_hint = (
         "SciVal API may not expose FWCI for some older papers even when Scopus.com shows it."
         if pub_year and pub_year < 2016
-        else "Try yearRange=10yrs with byYear=false or byYear=true in Publication Lookup."
+        else "Confirm this Scopus ID in Elsevier Publication Lookup (FWCI metric)."
     )
     return {
         "fwci": "N/A",
-        "note": f"FWCI not returned for Scopus ID {pub_id}{year_hint}. {api_hint}",
+        "note": f"FWCI not returned for Scopus ID {pub_id}{year_hint}.{window_hint} {api_hint}",
         "publication": publication,
         "pub_id": pub_id,
         "match_score": best_score,
