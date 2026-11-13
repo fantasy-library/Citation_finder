@@ -4575,9 +4575,36 @@ def _locked_view(reminder_message):
     st.caption("Add your API keys in **Step 1** in the sidebar to unlock the search view.")
 
 
+def _scival_options_enabled(key_prefix):
+    """True if any SciVal publication/metrics field is requested."""
+    return bool(
+        st.session_state.get(f"{key_prefix}_include_fwci")
+        or st.session_state.get(f"{key_prefix}_scival_details")
+        or st.session_state.get(f"{key_prefix}_scival_sdg")
+    )
+
+
 def _render_scival_fwci_options(key_prefix):
     """SciVal FWCI + optional publication metadata columns (same API response)."""
     with st.container(border=True):
+        st.markdown(f'<div id="scival-panel-{key_prefix}"></div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <style>
+            div:has(#scival-panel-{key_prefix}) label p {{
+                font-size: 1.12rem !important;
+            }}
+            div:has(#scival-panel-{key_prefix}) [data-testid="stCaptionContainer"] p {{
+                font-size: 1.06rem !important;
+            }}
+            div:has(#scival-panel-{key_prefix}) [data-testid="stMarkdownContainer"] p,
+            div:has(#scival-panel-{key_prefix}) [data-testid="stMarkdownContainer"] a {{
+                font-size: 1.06rem !important;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         icon_path = _icons_dir / "Scopus.png"
         head_left, head_right = st.columns([0.07, 0.93])
         with head_left:
@@ -4586,36 +4613,32 @@ def _render_scival_fwci_options(key_prefix):
             else:
                 st.markdown("### 📊")
         with head_right:
-            st.checkbox(
-                "📈 Include Scopus FWCI & SciVal fields",
-                value=False,
-                key=f"{key_prefix}_include_fwci",
-                help=_fwci_help_text(),
-            )
             st.caption(
-                "Adds SciVal Publication Lookup calls per DOI (slower). "
-                "Hover the ⓘ next to the checkbox for the FWCI definition."
+                "SciVal Publication Lookup runs when any option below is checked (slower per DOI). "
+                "Hover ⓘ on FWCI for the definition."
             )
             st.markdown(
                 f"[Learn more about Field-Weighted Citation Impact]({_SCIVAL_FWCI_LEARN_MORE})",
                 unsafe_allow_html=False,
             )
-        if st.session_state.get(f"{key_prefix}_include_fwci"):
-            opt_left, opt_right = st.columns(2)
-            with opt_left:
-                st.checkbox(
-                    "🧾 SciVal publication details (year, type, source, topics)",
-                    value=False,
-                    key=f"{key_prefix}_scival_details",
-                    help="From the same SciVal response: publicationYear, type, sourceTitle, topic, topic cluster.",
-                )
-            with opt_right:
-                st.checkbox(
-                    "🎯 Include SDG tags (UN Sustainable Development Goals)",
-                    value=False,
-                    key=f"{key_prefix}_scival_sdg",
-                    help="Sustainable Development Goal labels returned by SciVal for each publication.",
-                )
+        st.checkbox(
+            "📈 Include Scopus FWCI",
+            value=False,
+            key=f"{key_prefix}_include_fwci",
+            help=_fwci_help_text(),
+        )
+        st.checkbox(
+            "🧾 SciVal publication details (year, type, source, topics)",
+            value=False,
+            key=f"{key_prefix}_scival_details",
+            help="From the same SciVal response: publicationYear, type, sourceTitle, topic, topic cluster.",
+        )
+        st.checkbox(
+            "🎯 Include SDG tags (UN Sustainable Development Goals)",
+            value=False,
+            key=f"{key_prefix}_scival_sdg",
+            help="Sustainable Development Goal labels returned by SciVal for each publication.",
+        )
 
 
 # ==========================================
@@ -5140,9 +5163,10 @@ if app_mode == "Unified citation search":
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 unified_include_fwci = bool(_scopus_ok and st.session_state.get("unified_include_fwci"))
-                unified_scival_details = bool(unified_include_fwci and st.session_state.get("unified_scival_details"))
-                unified_scival_sdg = bool(unified_include_fwci and st.session_state.get("unified_scival_sdg"))
-                _fwci_steps = 1 if unified_include_fwci else 0
+                unified_scival_details = bool(_scopus_ok and st.session_state.get("unified_scival_details"))
+                unified_scival_sdg = bool(_scopus_ok and st.session_state.get("unified_scival_sdg"))
+                unified_scival_any = _scopus_ok and _scival_options_enabled("unified")
+                _fwci_steps = 1 if unified_scival_any else 0
                 total_steps = len(identifiers) * (
                     (_wos_ok and 1 or 0) + (_scopus_ok and 1 or 0) + _fwci_steps + (_gs_ok and 1 or 0)
                 )
@@ -5163,8 +5187,9 @@ if app_mode == "Unified citation search":
                         "Status (Scopus)": "N/A",
                         "Status (Google Scholar)": "N/A",
                     }
-                    if unified_include_fwci:
-                        row["Scopus FWCI"] = "N/A"
+                    if unified_scival_any:
+                        if unified_include_fwci:
+                            row["Scopus FWCI"] = "N/A"
                         row.update(_scival_optional_row_columns(None, unified_scival_details, unified_scival_sdg))
                     effective_doi = doi if doi and str(doi).startswith("10.") else None
                     if _wos_ok and effective_doi:
@@ -5190,13 +5215,14 @@ if app_mode == "Unified citation search":
                         step += 1
                         progress_bar.progress(min(step / total_steps, 1.0))
                         time.sleep(0.5)
-                    if unified_include_fwci and effective_doi:
-                        status_text.text(f"Scopus FWCI: {user_id[:50]}...")
+                    if unified_scival_any and effective_doi:
+                        status_text.text(f"SciVal: {user_id[:50]}...")
                         try:
                             scival = fetch_doi_scival(effective_doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
                             fwci_val = scival.get("fwci", "N/A")
                             fwci_note = scival.get("note", "")
-                            row["Scopus FWCI"] = fwci_val
+                            if unified_include_fwci:
+                                row["Scopus FWCI"] = fwci_val
                             row.update(
                                 _scival_optional_row_columns(
                                     scival.get("publication"),
@@ -5204,7 +5230,7 @@ if app_mode == "Unified citation search":
                                     unified_scival_sdg,
                                 )
                             )
-                            if fwci_note:
+                            if fwci_note and unified_include_fwci:
                                 scopus_status = row.get("Status (Scopus)", "N/A")
                                 if scopus_status == "Success":
                                     row["Status (Scopus)"] = f"{scopus_status} — {fwci_note}"
@@ -5213,8 +5239,9 @@ if app_mode == "Unified citation search":
                                 else:
                                     row["Status (Scopus)"] = f"{scopus_status}; {fwci_note}"
                         except Exception:
-                            row["Scopus FWCI"] = "N/A"
-                            if row.get("Status (Scopus)") in ("Success", "N/A"):
+                            if unified_include_fwci:
+                                row["Scopus FWCI"] = "N/A"
+                            if unified_include_fwci and row.get("Status (Scopus)") in ("Success", "N/A"):
                                 row["Status (Scopus)"] = "FWCI lookup error"
                         step += 1
                         progress_bar.progress(min(step / total_steps, 1.0))
@@ -5577,14 +5604,16 @@ elif app_mode == "Scopus":
                     status_text = st.empty()
                     results_list = []
                     include_fwci = bool(st.session_state.get("scopus_include_fwci"))
-                    scopus_scival_details = bool(include_fwci and st.session_state.get("scopus_scival_details"))
-                    scopus_scival_sdg = bool(include_fwci and st.session_state.get("scopus_scival_sdg"))
-                    sleep_time = 1.6 if include_fwci else 1.25
+                    scopus_scival_details = bool(st.session_state.get("scopus_scival_details"))
+                    scopus_scival_sdg = bool(st.session_state.get("scopus_scival_sdg"))
+                    scopus_scival_any = _scival_options_enabled("scopus")
+                    sleep_time = 1.6 if scopus_scival_any else 1.25
                     for i, doi in enumerate(all_dois):
                         status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
                         result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
-                        if include_fwci:
-                            result["FWCI"] = "N/A"
+                        if scopus_scival_any:
+                            if include_fwci:
+                                result["FWCI"] = "N/A"
                             result.update(
                                 _scival_optional_row_columns(None, scopus_scival_details, scopus_scival_sdg)
                             )
@@ -5592,7 +5621,8 @@ elif app_mode == "Scopus":
                                 scival = fetch_doi_scival(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
                                 fwci_val = scival.get("fwci", "N/A")
                                 fwci_note = scival.get("note", "")
-                                result["FWCI"] = fwci_val
+                                if include_fwci:
+                                    result["FWCI"] = fwci_val
                                 result.update(
                                     _scival_optional_row_columns(
                                         scival.get("publication"),
@@ -5600,16 +5630,17 @@ elif app_mode == "Scopus":
                                         scopus_scival_sdg,
                                     )
                                 )
-                                if fwci_note:
+                                if fwci_note and include_fwci:
                                     base_status = result.get("Status", "")
                                     if base_status == "Success":
                                         result["Status"] = f"{base_status} — {fwci_note}"
                                     else:
                                         result["Status"] = f"{base_status}; {fwci_note}".strip("; ")
                             except Exception:
-                                result["FWCI"] = "N/A"
-                                if result.get("Status") == "Success":
-                                    result["Status"] = "Success — FWCI lookup error"
+                                if include_fwci:
+                                    result["FWCI"] = "N/A"
+                                    if result.get("Status") == "Success":
+                                        result["Status"] = "Success — FWCI lookup error"
                             time.sleep(0.35)
                         results_list.append(result)
                         progress_bar.progress((i + 1) / len(all_dois))
@@ -5619,7 +5650,7 @@ elif app_mode == "Scopus":
                     export_cols = ["DOI", "Title", "Year", "Total Citations", "Exclude self-citations"]
                     if include_fwci:
                         export_cols.append("FWCI")
-                        if scopus_scival_details:
+                    if scopus_scival_details:
                             export_cols.extend(
                                 [
                                     "SciVal Year",
@@ -5629,8 +5660,8 @@ elif app_mode == "Scopus":
                                     "SciVal Topic cluster",
                                 ]
                             )
-                        if scopus_scival_sdg:
-                            export_cols.append("SciVal SDGs")
+                    if scopus_scival_sdg:
+                        export_cols.append("SciVal SDGs")
                     export_cols.append("Status")
                     df_results = df_results[[c for c in export_cols if c in df_results.columns]]
                     st.session_state["scopus_df"] = df_results
