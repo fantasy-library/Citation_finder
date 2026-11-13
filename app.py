@@ -1404,7 +1404,7 @@ def fetch_fwci_for_publication_ids(
         if text and text not in ids:
             ids.append(text)
     if not ids:
-        return {}, None, "No publication IDs"
+        return {}, None, "No publication IDs", None
     params = {
         **_SCIVAL_FWCI_PARAMS,
         "publicationIds": ",".join(ids),
@@ -1428,7 +1428,7 @@ def fetch_fwci_for_publication_ids(
             timeout=30,
         )
     except requests.RequestException as exc:
-        return {}, None, str(exc)[:120]
+        return {}, None, str(exc)[:120], None
     if response.status_code == 429 and _retry_count < 2:
         time.sleep(2)
         return fetch_fwci_for_publication_ids(
@@ -1443,12 +1443,84 @@ def fetch_fwci_for_publication_ids(
             publication_year=publication_year,
         )
     if response.status_code != 200:
-        return {}, response.status_code, response.text
+        return {}, response.status_code, response.text, None
     try:
         payload = response.json()
     except ValueError:
-        return {}, response.status_code, response.text
-    return _parse_fwci_metrics(payload, requested_ids=ids, publication_year=publication_year), response.status_code, None
+        return {}, response.status_code, response.text, None
+    metrics = _parse_fwci_metrics(payload, requested_ids=ids, publication_year=publication_year)
+    return metrics, response.status_code, None, payload
+
+
+def _extract_publication_meta(payload, pub_id):
+    """SciVal publication block from publication/metrics JSON (same response as FWCI)."""
+    if not isinstance(payload, dict):
+        return None
+    blocks = payload.get("results") or []
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    matched = None
+    fallback = None
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        pub = block.get("publication")
+        if not isinstance(pub, dict):
+            continue
+        if fallback is None:
+            fallback = pub
+        bid = pub.get("id")
+        if bid is not None and str(bid).lstrip("0") == str(pub_id).lstrip("0"):
+            matched = pub
+            break
+    return matched or fallback
+
+
+def _scival_optional_row_columns(publication, include_details=False, include_sdg=False):
+    """Optional export columns from SciVal publication metadata (no extra API calls)."""
+    cols = {}
+    if include_details:
+        if isinstance(publication, dict):
+            cols["SciVal Year"] = publication.get("publicationYear", "N/A")
+            cols["SciVal Type"] = publication.get("type", "N/A")
+            cols["SciVal Source"] = publication.get("sourceTitle", "N/A")
+            topic = publication.get("topicName") or ""
+            tid = publication.get("topicId")
+            cols["SciVal Topic"] = f"{topic} (ID {tid})" if topic and tid is not None else (topic or "N/A")
+            cluster = publication.get("topicClusterName") or ""
+            cid = publication.get("topicClusterId")
+            cols["SciVal Topic cluster"] = (
+                f"{cluster} (ID {cid})" if cluster and cid is not None else (cluster or "N/A")
+            )
+        else:
+            for name in (
+                "SciVal Year",
+                "SciVal Type",
+                "SciVal Source",
+                "SciVal Topic",
+                "SciVal Topic cluster",
+            ):
+                cols[name] = "N/A"
+    if include_sdg:
+        if isinstance(publication, dict):
+            sdgs = publication.get("sdg") or []
+            cols["SciVal SDGs"] = "; ".join(str(s) for s in sdgs) if sdgs else "N/A"
+        else:
+            cols["SciVal SDGs"] = "N/A"
+    return cols
+
+
+_SCIVAL_FWCI_LEARN_MORE = (
+    "https://www.elsevier.support/scopus/answer/what-is-fieldweighted-citation-impact"
+)
+
+
+def _fwci_help_text():
+    return (
+        "Field-Weighted Citation Impact is the ratio of citations received relative to the "
+        "expected world average for the subject field, publication type, and publication year. "
+        f"Learn more: {_SCIVAL_FWCI_LEARN_MORE}"
+    )
 
 
 def _pick_fwci_from_metrics(metrics, pub_id):
@@ -1465,30 +1537,32 @@ def _pick_fwci_from_metrics(metrics, pub_id):
     return value
 
 
-def fetch_doi_fwci(doi, api_key, inst_token):
-    """DOI → Scopus publication ID → SciVal FWCI (Publication Lookup API). Returns (value, status note)."""
+def fetch_doi_scival(doi, api_key, inst_token):
+    """DOI → SciVal publication/metrics bundle: FWCI value, status note, optional publication metadata."""
     pub_id, pub_year, status, body = lookup_scopus_publication_id_for_doi(doi, api_key, inst_token)
     if not pub_id:
+        note = "Could not resolve a Scopus publication ID for this DOI."
         if status == 404:
-            return "N/A", "No Scopus record for this DOI."
-        if status in (401, 403):
-            return "N/A", api_error_message("Scopus", status, body)
-        if status == 429:
-            return "N/A", api_error_message("Scopus", 429, body)
-        if status is None and body:
-            return "N/A", f"Scopus ID lookup failed: {body}"
-        return "N/A", "Could not resolve a Scopus publication ID for this DOI."
+            note = "No Scopus record for this DOI."
+        elif status in (401, 403):
+            note = api_error_message("Scopus", status, body)
+        elif status == 429:
+            note = api_error_message("Scopus", 429, body)
+        elif status is None and body:
+            note = f"Scopus ID lookup failed: {body}"
+        return {"fwci": "N/A", "note": note, "publication": None}
 
     query_attempts = (None,) + _FWCI_METRIC_FALLBACKS
     last_scival_status = None
     last_scival_body = None
+    last_payload = None
     for attempt in query_attempts:
         if attempt is None:
-            metrics, scival_status, scival_body = fetch_fwci_for_publication_ids(
+            metrics, scival_status, scival_body, payload = fetch_fwci_for_publication_ids(
                 [pub_id], api_key, inst_token, publication_year=pub_year
             )
         else:
-            metrics, scival_status, scival_body = fetch_fwci_for_publication_ids(
+            metrics, scival_status, scival_body, payload = fetch_fwci_for_publication_ids(
                 [pub_id],
                 api_key,
                 inst_token,
@@ -1498,6 +1572,8 @@ def fetch_doi_fwci(doi, api_key, inst_token):
             )
         last_scival_status = scival_status
         last_scival_body = scival_body
+        if payload:
+            last_payload = payload
         if scival_status in (401, 403, 429):
             break
         if scival_status and scival_status != 200:
@@ -1505,23 +1581,34 @@ def fetch_doi_fwci(doi, api_key, inst_token):
         value = _pick_fwci_from_metrics(metrics, pub_id)
         if value is not None:
             text = f"{value:.3f}".rstrip("0").rstrip(".")
-            return text, ""
+            publication = _extract_publication_meta(payload or last_payload, pub_id)
+            return {"fwci": text, "note": "", "publication": publication}
         if attempt is not None:
             time.sleep(0.15)
 
+    publication = _extract_publication_meta(last_payload, pub_id) if last_payload else None
     if last_scival_status in (401, 403):
-        return "N/A", api_error_message("Scival", last_scival_status, last_scival_body)
+        return {"fwci": "N/A", "note": api_error_message("Scival", last_scival_status, last_scival_body), "publication": publication}
     if last_scival_status == 429:
-        return "N/A", api_error_message("Scival", 429, last_scival_body)
+        return {"fwci": "N/A", "note": api_error_message("Scival", 429, last_scival_body), "publication": publication}
     if last_scival_status and last_scival_status != 200:
-        return "N/A", api_error_message("Scival", last_scival_status, last_scival_body)
+        return {"fwci": "N/A", "note": api_error_message("Scival", last_scival_status, last_scival_body), "publication": publication}
 
     year_hint = f", publication year {pub_year}" if pub_year else ""
-    return (
-        "N/A",
-        f"FWCI empty in SciVal API for publication ID {pub_id}{year_hint}. "
-        f"Try Publication Lookup with yearRange=10yrs and byYear=false (FieldWeightedCitationImpact).",
-    )
+    return {
+        "fwci": "N/A",
+        "note": (
+            f"FWCI empty in SciVal API for publication ID {pub_id}{year_hint}. "
+            "Try Publication Lookup with yearRange=10yrs and byYear=false (FieldWeightedCitationImpact)."
+        ),
+        "publication": publication,
+    }
+
+
+def fetch_doi_fwci(doi, api_key, inst_token):
+    """Backward-compatible wrapper: (FWCI display value, status note)."""
+    bundle = fetch_doi_scival(doi, api_key, inst_token)
+    return bundle.get("fwci", "N/A"), bundle.get("note", "")
 
 
 def extract_dois_from_df(df):
@@ -4488,6 +4575,49 @@ def _locked_view(reminder_message):
     st.caption("Add your API keys in **Step 1** in the sidebar to unlock the search view.")
 
 
+def _render_scival_fwci_options(key_prefix):
+    """SciVal FWCI + optional publication metadata columns (same API response)."""
+    with st.container(border=True):
+        icon_path = _icons_dir / "Scopus.png"
+        head_left, head_right = st.columns([0.07, 0.93])
+        with head_left:
+            if icon_path.exists():
+                st.image(str(icon_path), width=52)
+            else:
+                st.markdown("### 📊")
+        with head_right:
+            st.checkbox(
+                "📈 Include Scopus FWCI & SciVal fields",
+                value=False,
+                key=f"{key_prefix}_include_fwci",
+                help=_fwci_help_text(),
+            )
+            st.caption(
+                "Adds SciVal Publication Lookup calls per DOI (slower). "
+                "Hover the ⓘ next to the checkbox for the FWCI definition."
+            )
+            st.markdown(
+                f"[Learn more about Field-Weighted Citation Impact]({_SCIVAL_FWCI_LEARN_MORE})",
+                unsafe_allow_html=False,
+            )
+        if st.session_state.get(f"{key_prefix}_include_fwci"):
+            opt_left, opt_right = st.columns(2)
+            with opt_left:
+                st.checkbox(
+                    "🧾 SciVal publication details (year, type, source, topics)",
+                    value=False,
+                    key=f"{key_prefix}_scival_details",
+                    help="From the same SciVal response: publicationYear, type, sourceTitle, topic, topic cluster.",
+                )
+            with opt_right:
+                st.checkbox(
+                    "🎯 Include SDG tags (UN Sustainable Development Goals)",
+                    value=False,
+                    key=f"{key_prefix}_scival_sdg",
+                    help="Sustainable Development Goal labels returned by SciVal for each publication.",
+                )
+
+
 # ==========================================
 # UNIFIED CITATION SEARCH (all three platforms)
 # ==========================================
@@ -4951,14 +5081,7 @@ if app_mode == "Unified citation search":
                     )
     else:
         if _scopus_ok:
-            st.checkbox(
-                "Include Scopus FWCI (slower; requires SciVal access)",
-                value=False,
-                key="unified_include_fwci",
-                help="Adds SciVal Field-Weighted Citation Impact per DOI (extra API calls).",
-            )
-            if st.session_state.get("unified_include_fwci"):
-                st.caption("FWCI is field-weighted impact from SciVal; 1.0 = world average for similar papers. Independent of citation counts above.")
+            _render_scival_fwci_options("unified")
         raw_input = st.text_area(
             "📋 Paste DOIs (one per line)",
             height=200,
@@ -5017,6 +5140,8 @@ if app_mode == "Unified citation search":
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 unified_include_fwci = bool(_scopus_ok and st.session_state.get("unified_include_fwci"))
+                unified_scival_details = bool(unified_include_fwci and st.session_state.get("unified_scival_details"))
+                unified_scival_sdg = bool(unified_include_fwci and st.session_state.get("unified_scival_sdg"))
                 _fwci_steps = 1 if unified_include_fwci else 0
                 total_steps = len(identifiers) * (
                     (_wos_ok and 1 or 0) + (_scopus_ok and 1 or 0) + _fwci_steps + (_gs_ok and 1 or 0)
@@ -5040,6 +5165,7 @@ if app_mode == "Unified citation search":
                     }
                     if unified_include_fwci:
                         row["Scopus FWCI"] = "N/A"
+                        row.update(_scival_optional_row_columns(None, unified_scival_details, unified_scival_sdg))
                     effective_doi = doi if doi and str(doi).startswith("10.") else None
                     if _wos_ok and effective_doi:
                         status_text.text(f"WOS: {user_id[:50]}...")
@@ -5067,8 +5193,17 @@ if app_mode == "Unified citation search":
                     if unified_include_fwci and effective_doi:
                         status_text.text(f"Scopus FWCI: {user_id[:50]}...")
                         try:
-                            fwci_val, fwci_note = fetch_doi_fwci(effective_doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                            scival = fetch_doi_scival(effective_doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                            fwci_val = scival.get("fwci", "N/A")
+                            fwci_note = scival.get("note", "")
                             row["Scopus FWCI"] = fwci_val
+                            row.update(
+                                _scival_optional_row_columns(
+                                    scival.get("publication"),
+                                    unified_scival_details,
+                                    unified_scival_sdg,
+                                )
+                            )
                             if fwci_note:
                                 scopus_status = row.get("Status (Scopus)", "N/A")
                                 if scopus_status == "Success":
@@ -5412,14 +5547,7 @@ elif app_mode == "Scopus":
         if scopus_search_mode == "Citation finder (by DOI)":
             st.markdown("Fetch **citation metrics** (total and exclude self-citations) by **DOI**.")
             st.caption("Paste DOIs (one per line) or upload a CSV/Excel file with a DOI column.")
-            st.checkbox(
-                "Include Scopus FWCI (slower; requires SciVal access)",
-                value=False,
-                key="scopus_include_fwci",
-                help="Adds SciVal Field-Weighted Citation Impact per DOI (extra API calls).",
-            )
-            if st.session_state.get("scopus_include_fwci"):
-                st.caption("FWCI is field-weighted impact from SciVal; 1.0 = world average for similar papers.")
+            _render_scival_fwci_options("scopus")
             raw_dois = st.text_area("📋 Paste DOIs (one per line)", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
             uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
 
@@ -5449,14 +5577,29 @@ elif app_mode == "Scopus":
                     status_text = st.empty()
                     results_list = []
                     include_fwci = bool(st.session_state.get("scopus_include_fwci"))
+                    scopus_scival_details = bool(include_fwci and st.session_state.get("scopus_scival_details"))
+                    scopus_scival_sdg = bool(include_fwci and st.session_state.get("scopus_scival_sdg"))
                     sleep_time = 1.6 if include_fwci else 1.25
                     for i, doi in enumerate(all_dois):
                         status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
                         result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
                         if include_fwci:
+                            result["FWCI"] = "N/A"
+                            result.update(
+                                _scival_optional_row_columns(None, scopus_scival_details, scopus_scival_sdg)
+                            )
                             try:
-                                fwci_val, fwci_note = fetch_doi_fwci(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                                scival = fetch_doi_scival(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                                fwci_val = scival.get("fwci", "N/A")
+                                fwci_note = scival.get("note", "")
                                 result["FWCI"] = fwci_val
+                                result.update(
+                                    _scival_optional_row_columns(
+                                        scival.get("publication"),
+                                        scopus_scival_details,
+                                        scopus_scival_sdg,
+                                    )
+                                )
                                 if fwci_note:
                                     base_status = result.get("Status", "")
                                     if base_status == "Success":
@@ -5476,6 +5619,18 @@ elif app_mode == "Scopus":
                     export_cols = ["DOI", "Title", "Year", "Total Citations", "Exclude self-citations"]
                     if include_fwci:
                         export_cols.append("FWCI")
+                        if scopus_scival_details:
+                            export_cols.extend(
+                                [
+                                    "SciVal Year",
+                                    "SciVal Type",
+                                    "SciVal Source",
+                                    "SciVal Topic",
+                                    "SciVal Topic cluster",
+                                ]
+                            )
+                        if scopus_scival_sdg:
+                            export_cols.append("SciVal SDGs")
                     export_cols.append("Status")
                     df_results = df_results[[c for c in export_cols if c in df_results.columns]]
                     st.session_state["scopus_df"] = df_results
