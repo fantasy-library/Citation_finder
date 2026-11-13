@@ -1366,12 +1366,50 @@ _SCIVAL_FWCI_PARAMS = {
     "showAsFieldWeighted": "false",
 }
 
-_FWCI_METRIC_FALLBACKS = (
+# Older publication years often need byYear=true + valueByYear (aggregate byYear=false can be empty).
+_FWCI_METRIC_ATTEMPTS = (
+    None,  # default: 10yrs, byYear=false
+    {"byYear": "true", "yearRange": "10yrs"},
     {"byYear": "true", "yearRange": "5yrs"},
     {"byYear": "false", "yearRange": "5yrs"},
-    {"byYear": "true", "yearRange": "10yrs"},
     {"byYear": "true", "yearRange": "5yrsAndCurrent"},
+    {"byYear": "false", "yearRange": "5yrsAndCurrent"},
 )
+
+
+def _fwci_value_from_response(metrics, payload, pub_id, publication_year=None):
+    """Resolve FWCI from parsed metrics map or raw SciVal payload."""
+    value = _pick_fwci_from_metrics(metrics, pub_id)
+    if value is not None:
+        return value
+    if not payload:
+        return None
+    value = _deep_scan_fwci_payload(payload, publication_year)
+    if value is not None:
+        return value
+    blocks = (payload.get("results") or []) if isinstance(payload, dict) else []
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        value = _fwci_from_result_block(block, publication_year)
+        if value is not None:
+            return value
+    return None
+
+
+def _refresh_publication_year_from_payload(payload, pub_id, pub_year):
+    pub_meta = _extract_publication_meta(payload, pub_id)
+    if not pub_meta:
+        return pub_year
+    scival_year = pub_meta.get("publicationYear")
+    if scival_year is None:
+        return pub_year
+    try:
+        return int(scival_year)
+    except (TypeError, ValueError):
+        return pub_year
 
 
 def lookup_scopus_publication_id_for_doi(doi, api_key, inst_token):
@@ -1552,11 +1590,18 @@ def fetch_doi_scival(doi, api_key, inst_token):
             note = f"Scopus ID lookup failed: {body}"
         return {"fwci": "N/A", "note": note, "publication": None}
 
-    query_attempts = (None,) + _FWCI_METRIC_FALLBACKS
+    # Pre-2016 papers: try byYear=true first so valueByYear can supply the publication-year FWCI.
+    if pub_year and pub_year < 2016:
+        query_attempts = (
+            {"byYear": "true", "yearRange": "10yrs"},
+        ) + _FWCI_METRIC_ATTEMPTS
+    else:
+        query_attempts = _FWCI_METRIC_ATTEMPTS
+
     last_scival_status = None
     last_scival_body = None
     last_payload = None
-    for attempt in query_attempts:
+    for index, attempt in enumerate(query_attempts):
         if attempt is None:
             metrics, scival_status, scival_body, payload = fetch_fwci_for_publication_ids(
                 [pub_id], api_key, inst_token, publication_year=pub_year
@@ -1574,17 +1619,18 @@ def fetch_doi_scival(doi, api_key, inst_token):
         last_scival_body = scival_body
         if payload:
             last_payload = payload
+            pub_year = _refresh_publication_year_from_payload(payload, pub_id, pub_year)
         if scival_status in (401, 403, 429):
             break
         if scival_status and scival_status != 200:
             continue
-        value = _pick_fwci_from_metrics(metrics, pub_id)
+        value = _fwci_value_from_response(metrics, payload, pub_id, pub_year)
         if value is not None:
             text = f"{value:.3f}".rstrip("0").rstrip(".")
             publication = _extract_publication_meta(payload or last_payload, pub_id)
             return {"fwci": text, "note": "", "publication": publication}
-        if attempt is not None:
-            time.sleep(0.15)
+        if index < len(query_attempts) - 1:
+            time.sleep(0.12)
 
     publication = _extract_publication_meta(last_payload, pub_id) if last_payload else None
     if last_scival_status in (401, 403):
@@ -1594,13 +1640,15 @@ def fetch_doi_scival(doi, api_key, inst_token):
     if last_scival_status and last_scival_status != 200:
         return {"fwci": "N/A", "note": api_error_message("Scival", last_scival_status, last_scival_body), "publication": publication}
 
-    year_hint = f", publication year {pub_year}" if pub_year else ""
+    year_hint = f" (publication year {pub_year})" if pub_year else ""
+    api_hint = (
+        "SciVal API may not expose FWCI for some older papers even when Scopus.com shows it."
+        if pub_year and pub_year < 2016
+        else "Try yearRange=10yrs with byYear=false or byYear=true in Publication Lookup."
+    )
     return {
         "fwci": "N/A",
-        "note": (
-            f"FWCI empty in SciVal API for publication ID {pub_id}{year_hint}. "
-            "Try Publication Lookup with yearRange=10yrs and byYear=false (FieldWeightedCitationImpact)."
-        ),
+        "note": f"FWCI not returned for Scopus ID {pub_id}{year_hint}. {api_hint}",
         "publication": publication,
     }
 
