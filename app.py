@@ -276,26 +276,26 @@ if _scopus_ok:
         with _q_cols[0]:
             _probe_citations = st.button(
                 "Check citations quota",
-                key="scopus_quota_citations",
+                key="scopus_quota_btn_citations",
                 use_container_width=True,
             )
         with _q_cols[1]:
             _probe_scival = st.button(
                 "Check SciVal quota",
-                key="scopus_quota_scival",
+                key="scopus_quota_btn_scival",
                 use_container_width=True,
             )
         if _probe_citations:
-            st.session_state["scopus_quota_citations"] = probe_elsevier_scopus_quota(
+            st.session_state["scopus_quota_info_citations"] = probe_elsevier_scopus_quota(
                 SCOPUS_API_KEY, SCOPUS_INST_TOKEN, endpoint="citations"
             )
         if _probe_scival:
-            st.session_state["scopus_quota_scival"] = probe_elsevier_scopus_quota(
+            st.session_state["scopus_quota_info_scival"] = probe_elsevier_scopus_quota(
                 SCOPUS_API_KEY, SCOPUS_INST_TOKEN, endpoint="scival_metrics"
             )
         for _slot, _label in (
-            ("scopus_quota_citations", "Abstract Citations"),
-            ("scopus_quota_scival", "SciVal metrics"),
+            ("scopus_quota_info_citations", "Abstract Citations"),
+            ("scopus_quota_info_scival", "SciVal metrics"),
         ):
             _info = st.session_state.get(_slot)
             if not _info:
