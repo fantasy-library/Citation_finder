@@ -312,6 +312,20 @@ if _scopus_ok:
             _render_scopus_quota_panel("Abstract Citations (by DOI)", _quota.get("citations") or {})
             st.divider()
             _render_scopus_quota_panel("SciVal (FWCI / publication metadata)", _quota.get("scival") or {})
+        with st.expander("How is quota counted?", expanded=bool(_quota)):
+            st.markdown(
+                """
+**Elsevier counts each API HTTP request** toward that product’s weekly limit — not “one DOI = 1” by default.
+
+| What you run in this app | What uses quota |
+| --- | --- |
+| **Scopus citation by DOI** | **2 requests per DOI** to *Abstract Citations* (total count + exclude self-citations). |
+| **SciVal options** (FWCI, details, and/or SDGs) | **SciVal** requests per DOI while options are on. The app caches SciVal per DOI **within one search**, so repeating the same DOI in the same run does not call SciVal again. FWCI may try a few parameter sets (capped) until a value is found. |
+| **Check remaining quota** (above) | **1** citations request + **1** SciVal request. |
+
+*Abstract Citations* and *SciVal* numbers above are **independent** — a DOI search can draw from both pools. WoS and Google Scholar use their own keys and are not included here.
+                """.strip()
+            )
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🧭 Step 2: Navigation")
 try:
