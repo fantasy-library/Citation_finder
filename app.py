@@ -81,6 +81,32 @@ def fetch_doi_scival_cached(
     return cache[key]
 
 
+def _fetch_scopus_quota_snapshot(api_key, inst_token):
+    """One probe per Elsevier product (citations vs SciVal); quotas are separate."""
+    return {
+        "citations": probe_elsevier_scopus_quota(api_key, inst_token, endpoint="citations"),
+        "scival": probe_elsevier_scopus_quota(api_key, inst_token, endpoint="scival_metrics"),
+    }
+
+
+def _render_scopus_quota_panel(title, info):
+    st.markdown(f"**{title}**")
+    if info.get("remaining") is not None:
+        _lim = info.get("limit")
+        st.write(
+            f"Remaining: **{info['remaining']:,}**"
+            + (f" / {_lim:,}" if _lim is not None else "")
+        )
+    elif info.get("note"):
+        st.caption(info["note"])
+    if info.get("reset_at"):
+        st.caption(f"Resets: {info['reset_at']}")
+    if info.get("els_status"):
+        st.caption(f"Status: {info['els_status']}")
+    if info.get("note") and info.get("remaining") is not None and not info.get("ok"):
+        st.caption(info["note"])
+
+
 # Checkpoint often enough to resume, while keeping each automatic run reasonably long.
 JOURNAL_BATCH_SIZE = 40
 JOURNAL_FETCH_WORKERS = 6
@@ -267,56 +293,25 @@ st.sidebar.markdown(
     f"**Platforms:** WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}"
 )
 if _scopus_ok:
-    with st.sidebar.expander("📊 Scopus API quota", expanded=False):
+    with st.sidebar.expander("📊 Scopus weekly API quota", expanded=False):
         st.caption(
-            "Uses one test request; reads **X-RateLimit-Remaining** from Elsevier headers "
-            "(weekly limit is **per API**, not shared across Scopus vs SciVal)."
+            "Elsevier sets **separate** weekly limits for citation lookups and SciVal (FWCI/SDG). "
+            "One click checks both (two lightweight test requests)."
         )
-        _q_cols = st.columns(2)
-        with _q_cols[0]:
-            _probe_citations = st.button(
-                "Check citations quota",
-                key="scopus_quota_btn_citations",
-                use_container_width=True,
-            )
-        with _q_cols[1]:
-            _probe_scival = st.button(
-                "Check SciVal quota",
-                key="scopus_quota_btn_scival",
-                use_container_width=True,
-            )
-        if _probe_citations:
-            st.session_state["scopus_quota_info_citations"] = probe_elsevier_scopus_quota(
-                SCOPUS_API_KEY, SCOPUS_INST_TOKEN, endpoint="citations"
-            )
-        if _probe_scival:
-            st.session_state["scopus_quota_info_scival"] = probe_elsevier_scopus_quota(
-                SCOPUS_API_KEY, SCOPUS_INST_TOKEN, endpoint="scival_metrics"
-            )
-        for _slot, _label in (
-            ("scopus_quota_info_citations", "Abstract Citations"),
-            ("scopus_quota_info_scival", "SciVal metrics"),
+        if st.button(
+            "Check remaining quota",
+            key="scopus_quota_btn_check",
+            use_container_width=True,
         ):
-            _info = st.session_state.get(_slot)
-            if not _info:
-                continue
-            st.markdown(f"**{_label}**")
-            if _info.get("remaining") is not None:
-                _lim = _info.get("limit")
-                st.write(
-                    f"Remaining: **{_info['remaining']:,}**"
-                    + (f" / {_lim:,}" if _lim is not None else "")
+            with st.spinner("Reading quota headers…"):
+                st.session_state["scopus_quota_snapshot"] = _fetch_scopus_quota_snapshot(
+                    SCOPUS_API_KEY, SCOPUS_INST_TOKEN
                 )
-            if _info.get("reset_at"):
-                st.caption(f"Resets: {_info['reset_at']}")
-            if _info.get("els_status"):
-                st.caption(f"ELS status: {_info['els_status']}")
-            if _info.get("note"):
-                st.caption(_info["note"])
-        st.caption(
-            "Bulk tip: ~2 calls per DOI for citations (total + exclude-self); "
-            "+1+ for SciVal when FWCI/SDG options are on. Batch ~100 DOIs and pause if you see 429."
-        )
+        _quota = st.session_state.get("scopus_quota_snapshot")
+        if _quota:
+            _render_scopus_quota_panel("Abstract Citations (by DOI)", _quota.get("citations") or {})
+            st.divider()
+            _render_scopus_quota_panel("SciVal (FWCI / publication metadata)", _quota.get("scival") or {})
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🧭 Step 2: Navigation")
 try:
