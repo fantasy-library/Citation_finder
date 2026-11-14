@@ -315,15 +315,22 @@ if _scopus_ok:
         with st.expander("How is quota counted?", expanded=bool(_quota)):
             st.markdown(
                 """
-**Elsevier counts each API HTTP request** toward that product’s weekly limit — not “one DOI = 1” by default.
+Each time this app asks Elsevier for data, that counts as **one use** off the weekly allowance shown above.  
+It is **not** always “one DOI = one use.”
 
-| What you run in this app | What uses quota |
-| --- | --- |
-| **Scopus citation by DOI** | **2 requests per DOI** to *Abstract Citations* (total count + exclude self-citations). |
-| **SciVal options** (FWCI, details, and/or SDGs) | **SciVal** requests per DOI while options are on. The app caches SciVal per DOI **within one search**, so repeating the same DOI in the same run does not call SciVal again. FWCI may try a few parameter sets (capped) until a value is found. |
-| **Check remaining quota** (above) | **1** citations request + **1** SciVal request. |
+There are **two separate weekly allowances** (the two numbers you see):
 
-*Abstract Citations* and *SciVal* numbers above are **independent** — a DOI search can draw from both pools. WoS and Google Scholar use their own keys and are not included here.
+- **Abstract Citations** — used when you fetch **citation counts** from Scopus.
+- **SciVal** — used when you turn on **FWCI**, **SciVal details**, or **SDGs**.
+
+**Examples**
+
+- You search **10 DOIs** for Scopus citations only (no FWCI): about **20** uses from *Abstract Citations* (2 per DOI: total + exclude self-citations).
+- Same **10 DOIs** with **FWCI or SDG** turned on: you also spend from the *SciVal* allowance (often several uses per DOI the first time; the app stops after a sensible number of tries).
+- The **same DOI appears twice in one paste/list**: citations are still counted twice if you process both rows; SciVal is only called **once per DOI per run** for the extra options.
+- You click **Check remaining quota**: **1** use from each pool (the small test calls).
+
+Web of Science and Google Scholar are different services and do not change these two Elsevier counters.
                 """.strip()
             )
 st.sidebar.markdown("---")
