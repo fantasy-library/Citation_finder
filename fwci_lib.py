@@ -4,6 +4,7 @@ Publication-level FWCI uses GET /analytics/scival/publication/metrics with
 metricTypes=FieldWeightedCitationImpact (Elsevier Publication Lookup API).
 Spec: https://dev.elsevier.com/documentation/SciValPublicationAPI.wadl
 """
+FWCI_LIB_VERSION = "2026.03"
 import re
 import time
 from datetime import datetime, timezone

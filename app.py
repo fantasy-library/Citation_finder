@@ -1,4 +1,6 @@
 import html
+import importlib.util
+import sys
 import streamlit as st
 import requests
 import pandas as pd
@@ -16,18 +18,50 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote, unquote, urlencode
 
-from fwci_lib import (
-    fetch_doi_scival,
-    fetch_doi_fwci,
-    format_fwci_status,
-    probe_elsevier_scopus_quota,
-    scopus_id_year_from_citations_payload,
-    _coerce_year,
-    _extract_publication_meta,
-    _scival_optional_row_columns,
-    _fwci_help_text,
-    _SCIVAL_FWCI_LEARN_MORE,
-)
+_APP_DIR = Path(__file__).resolve().parent
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
+
+
+def _load_fwci_lib_module():
+    """Load fwci_lib from the same folder as app.py (Streamlit Cloud-safe)."""
+    fwci_path = _APP_DIR / "fwci_lib.py"
+    if not fwci_path.is_file():
+        raise ImportError(
+            f"fwci_lib.py is missing next to app.py ({_APP_DIR}). "
+            "Deploy the latest GitHub main branch (file must be in the repo root)."
+        )
+    spec = importlib.util.spec_from_file_location("fwci_lib", fwci_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load fwci_lib from {fwci_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fwci_lib"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    _fwci_lib = _load_fwci_lib_module()
+except Exception as _fwci_err:
+    st.error("SciVal / FWCI module failed to load.")
+    st.markdown(
+        "This usually means **`fwci_lib.py`** is not on the server, the deploy is outdated, "
+        "or **`requests`** failed to install. Sync to latest **`main`** on GitHub, check "
+        "**Manage app → Logs**, then **Reboot app**."
+    )
+    st.code(f"{type(_fwci_err).__name__}: {_fwci_err}")
+    st.stop()
+
+fetch_doi_scival = _fwci_lib.fetch_doi_scival
+fetch_doi_fwci = _fwci_lib.fetch_doi_fwci
+format_fwci_status = _fwci_lib.format_fwci_status
+probe_elsevier_scopus_quota = _fwci_lib.probe_elsevier_scopus_quota
+scopus_id_year_from_citations_payload = _fwci_lib.scopus_id_year_from_citations_payload
+_coerce_year = _fwci_lib._coerce_year
+_extract_publication_meta = _fwci_lib._extract_publication_meta
+_scival_optional_row_columns = _fwci_lib._scival_optional_row_columns
+_fwci_help_text = _fwci_lib._fwci_help_text
+_SCIVAL_FWCI_LEARN_MORE = _fwci_lib._SCIVAL_FWCI_LEARN_MORE
 
 
 def fetch_doi_scival_cached(
