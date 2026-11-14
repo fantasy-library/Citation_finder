@@ -6,9 +6,13 @@ Spec: https://dev.elsevier.com/documentation/SciValPublicationAPI.wadl
 """
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import requests
+
+# Lightweight DOI for quota probes (one Abstract Citations request; limits are per API).
+_SCOPUS_QUOTA_PROBE_DOI = "10.1016/j.ocemod.2003.12.006"
 
 
 def scival_api_error_message(service, status_code, response_body=None):
@@ -41,6 +45,145 @@ def _elsevier_headers(api_key, inst_token):
         "X-ELS-APIKey": api_key,
         "X-ELS-Insttoken": inst_token,
     }
+
+
+def _coerce_rate_limit_int(value):
+    if value is None:
+        return None
+    text = str(value).strip().strip('"').strip("'")
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        match = re.search(r"(\d+)", text)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+    return None
+
+
+def parse_elsevier_rate_limit_headers(headers):
+    """Read X-RateLimit-* and X-ELS-Status from an Elsevier API response."""
+    if not headers:
+        return {}
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+
+    remaining = _coerce_rate_limit_int(lowered.get("x-ratelimit-remaining"))
+    limit = _coerce_rate_limit_int(lowered.get("x-ratelimit-limit"))
+    reset_raw = lowered.get("x-ratelimit-reset")
+    reset_at = None
+    if reset_raw is not None:
+        reset_text = str(reset_raw).strip().strip('"')
+        if reset_text.isdigit():
+            try:
+                reset_at = datetime.fromtimestamp(int(reset_text), tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+            except (ValueError, OSError):
+                reset_at = reset_text
+        else:
+            reset_at = reset_text
+
+    els_status = lowered.get("x-els-status")
+    if els_status is not None:
+        els_status = str(els_status).strip().strip('"')
+
+    return {
+        "remaining": remaining,
+        "limit": limit,
+        "reset_at": reset_at,
+        "els_status": els_status,
+    }
+
+
+def probe_elsevier_scopus_quota(
+    api_key,
+    inst_token,
+    doi=None,
+    *,
+    endpoint="citations",
+    citation_mode="exclude-self",
+):
+    """One small Elsevier request; quota from X-RateLimit-* headers (per API, weekly reset)."""
+    if not api_key or not str(api_key).strip():
+        return {"ok": False, "note": "Missing Scopus API key.", "endpoint": endpoint}
+    if not inst_token or not str(inst_token).strip():
+        return {"ok": False, "note": "Missing Scopus institutional token.", "endpoint": endpoint}
+
+    doi_text = quote(str(doi or _SCOPUS_QUOTA_PROBE_DOI).strip(), safe="")
+    headers = _elsevier_headers(api_key, inst_token)
+    out = {
+        "ok": False,
+        "endpoint": endpoint,
+        "api_label": "",
+        "http_status": None,
+        "remaining": None,
+        "limit": None,
+        "reset_at": None,
+        "els_status": None,
+        "note": "",
+    }
+
+    try:
+        if endpoint == "scival_metrics":
+            out["api_label"] = "SciVal publication/metrics"
+            params = {
+                "metricTypes": "CitationCount",
+                "publicationIds": "85036568406",
+                "yearRange": "5yrs",
+                "byYear": "false",
+                "httpAccept": "application/json",
+                "apiKey": api_key,
+                "insttoken": inst_token,
+            }
+            response = requests.get(
+                "https://api.elsevier.com/analytics/scival/publication/metrics",
+                params=params,
+                headers=headers,
+                timeout=30,
+            )
+        else:
+            out["api_label"] = "Abstract Citations (by DOI)"
+            url = (
+                f"https://api.elsevier.com/content/abstract/citations?doi={doi_text}"
+                f"&apiKey={api_key}&insttoken={inst_token}&httpAccept=application/json"
+            )
+            if citation_mode == "exclude-self":
+                url += "&citation=exclude-self"
+            response = requests.get(url, headers=headers, timeout=30)
+    except requests.RequestException as exc:
+        out["note"] = f"Quota probe failed: {str(exc)[:100]}"
+        return out
+
+    out["http_status"] = response.status_code
+    limits = parse_elsevier_rate_limit_headers(response.headers)
+    out.update(limits)
+
+    if out["remaining"] is not None and out["limit"] is not None:
+        out["note"] = f"{out['remaining']:,} of {out['limit']:,} requests left for {out['api_label']}."
+        out["ok"] = response.status_code == 200 or (
+            out["remaining"] is not None and "QUOTA_EXCEEDED" not in str(out.get("els_status") or "")
+        )
+    elif out.get("els_status") and "QUOTA_EXCEEDED" in str(out["els_status"]).upper():
+        out["note"] = "Weekly quota exceeded for this API (X-ELS-Status: QUOTA_EXCEEDED)."
+        out["ok"] = False
+    elif response.status_code in (401, 403):
+        out["note"] = scival_api_error_message("Scopus", response.status_code, response.text)
+        out["ok"] = False
+    elif response.status_code == 429:
+        out["note"] = scival_api_error_message("Scopus", 429, response.text)
+        out["ok"] = False
+    else:
+        out["note"] = (
+            "No X-RateLimit headers on this response. "
+            "Elsevier may omit them for some errors or API products."
+        )
+        out["ok"] = response.status_code == 200
+
+    return out
 
 
 def scopus_id_year_from_citations_payload(payload):

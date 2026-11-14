@@ -48,6 +48,19 @@ class FwciParserTests(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
         self.assertEqual(attempts[0], {"byYear": "true", "yearRange": "5yrs"})
 
+    def test_parse_rate_limit_headers(self):
+        headers = {
+            "X-RateLimit-Limit": "20000",
+            "X-RateLimit-Remaining": "1227",
+            "X-RateLimit-Reset": "1692342443",
+            "X-ELS-Status": "OK",
+        }
+        parsed = lib.parse_elsevier_rate_limit_headers(headers)
+        self.assertEqual(parsed["remaining"], 1227)
+        self.assertEqual(parsed["limit"], 20000)
+        self.assertEqual(parsed["els_status"], "OK")
+        self.assertIn("UTC", parsed["reset_at"])
+
     def test_collect_multiple_sdgs(self):
         publication = {
             "sdg": [

@@ -20,6 +20,7 @@ from fwci_lib import (
     fetch_doi_scival,
     fetch_doi_fwci,
     format_fwci_status,
+    probe_elsevier_scopus_quota,
     scopus_id_year_from_citations_payload,
     _coerce_year,
     _extract_publication_meta,
@@ -231,6 +232,57 @@ _wos_ok, _scopus_ok, _gs_ok = _platform_status()
 st.sidebar.markdown(
     f"**Platforms:** WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}"
 )
+if _scopus_ok:
+    with st.sidebar.expander("📊 Scopus API quota", expanded=False):
+        st.caption(
+            "Uses one test request; reads **X-RateLimit-Remaining** from Elsevier headers "
+            "(weekly limit is **per API**, not shared across Scopus vs SciVal)."
+        )
+        _q_cols = st.columns(2)
+        with _q_cols[0]:
+            _probe_citations = st.button(
+                "Check citations quota",
+                key="scopus_quota_citations",
+                use_container_width=True,
+            )
+        with _q_cols[1]:
+            _probe_scival = st.button(
+                "Check SciVal quota",
+                key="scopus_quota_scival",
+                use_container_width=True,
+            )
+        if _probe_citations:
+            st.session_state["scopus_quota_citations"] = probe_elsevier_scopus_quota(
+                SCOPUS_API_KEY, SCOPUS_INST_TOKEN, endpoint="citations"
+            )
+        if _probe_scival:
+            st.session_state["scopus_quota_scival"] = probe_elsevier_scopus_quota(
+                SCOPUS_API_KEY, SCOPUS_INST_TOKEN, endpoint="scival_metrics"
+            )
+        for _slot, _label in (
+            ("scopus_quota_citations", "Abstract Citations"),
+            ("scopus_quota_scival", "SciVal metrics"),
+        ):
+            _info = st.session_state.get(_slot)
+            if not _info:
+                continue
+            st.markdown(f"**{_label}**")
+            if _info.get("remaining") is not None:
+                _lim = _info.get("limit")
+                st.write(
+                    f"Remaining: **{_info['remaining']:,}**"
+                    + (f" / {_lim:,}" if _lim is not None else "")
+                )
+            if _info.get("reset_at"):
+                st.caption(f"Resets: {_info['reset_at']}")
+            if _info.get("els_status"):
+                st.caption(f"ELS status: {_info['els_status']}")
+            if _info.get("note"):
+                st.caption(_info["note"])
+        st.caption(
+            "Bulk tip: ~2 calls per DOI for citations (total + exclude-self); "
+            "+1+ for SciVal when FWCI/SDG options are on. Batch ~100 DOIs and pause if you see 429."
+        )
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🧭 Step 2: Navigation")
 try:
