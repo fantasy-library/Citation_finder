@@ -325,7 +325,7 @@ There are **two separate weekly allowances** (the two numbers you see):
 
 **Examples**
 
-- You search **10 DOIs** for Scopus citations only (no FWCI): about **20** uses from *Abstract Citations* (2 per DOI: total + exclude self-citations).
+- You search **10 DOIs** for Scopus citations with the default settings: about **20** uses from *Abstract Citations* (2 per DOI). With **Total citations only** checked: about **10** uses (1 per DOI).
 - Same **10 DOIs** with **FWCI or SDG** turned on: you also spend from the *SciVal* allowance (often several uses per DOI the first time; the app stops after a sensible number of tries).
 - The **same DOI appears twice in one paste/list**: citations are still counted twice if you process both rows; SciVal is only called **once per DOI per run** for the extra options.
 - You click **Check remaining quota**: **1** use from each pool (the small test calls).
@@ -1084,8 +1084,8 @@ def fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False, _retr
     return response.json()
 
 
-def process_doi_scopus(doi, api_key, inst_token):
-    """Processes a single DOI to get both metadata and citation metrics."""
+def process_doi_scopus(doi, api_key, inst_token, *, fetch_exclude_self=True):
+    """Processes a single DOI to get metadata and citation metrics."""
     try:
         data_total = fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=False)
         scopus_pub_id, scopus_pub_year = scopus_id_year_from_citations_payload(data_total)
@@ -1100,9 +1100,12 @@ def process_doi_scopus(doi, api_key, inst_token):
         pub_type = article_data.get("citationType", {}).get("$", "Type not available") if isinstance(article_data.get("citationType"), dict) else "Type not available"
         year = article_data.get("sort-year", "Year not available")
 
-        data_exclude = fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=True)
-        cite_header_ex = data_exclude.get("abstract-citations-response", {}).get("citeColumnTotalXML", {}).get("citeCountHeader", {})
-        exclude_self_citations = cite_header_ex.get("grandTotal", 0)
+        if fetch_exclude_self:
+            data_exclude = fetch_elsevier_citations(doi, api_key, inst_token, exclude_self=True)
+            cite_header_ex = data_exclude.get("abstract-citations-response", {}).get("citeColumnTotalXML", {}).get("citeCountHeader", {})
+            exclude_self_citations = cite_header_ex.get("grandTotal", 0)
+        else:
+            exclude_self_citations = "Not fetched"
 
         return {
             "DOI": doi,
@@ -4126,6 +4129,21 @@ def _scival_options_enabled(key_prefix):
     )
 
 
+def _scopus_citations_exclude_self_enabled(key_prefix):
+    """When False, only one Abstract Citations call per DOI (total count)."""
+    return not bool(st.session_state.get(f"{key_prefix}_scopus_total_only"))
+
+
+def _render_scopus_citation_quota_option(key_prefix):
+    """Optional: skip exclude-self call to halve Abstract Citations quota per DOI."""
+    st.checkbox(
+        "💾 Total citations only (1 Scopus API call per DOI)",
+        value=False,
+        key=f"{key_prefix}_scopus_total_only",
+        help="Skips exclude-self-citations. Uses half the Abstract Citations weekly quota on large DOI lists.",
+    )
+
+
 def _render_scival_fwci_options(key_prefix):
     """SciVal FWCI + optional publication metadata columns (same API response)."""
     with st.container(border=True):
@@ -4646,6 +4664,7 @@ if app_mode == "Unified citation search":
                     )
     else:
         if _scopus_ok:
+            _render_scopus_citation_quota_option("unified")
             _render_scival_fwci_options("unified")
         raw_input = st.text_area(
             "📋 Paste DOIs (one per line)",
@@ -4709,6 +4728,7 @@ if app_mode == "Unified citation search":
                 unified_scival_details = bool(_scopus_ok and st.session_state.get("unified_scival_details"))
                 unified_scival_sdg = bool(_scopus_ok and st.session_state.get("unified_scival_sdg"))
                 unified_scival_any = _scopus_ok and _scival_options_enabled("unified")
+                unified_scopus_excl = _scopus_citations_exclude_self_enabled("unified")
                 _fwci_steps = 1 if unified_scival_any else 0
                 total_steps = len(identifiers) * (
                     (_wos_ok and 1 or 0) + (_scopus_ok and 1 or 0) + _fwci_steps + (_gs_ok and 1 or 0)
@@ -4750,7 +4770,12 @@ if app_mode == "Unified citation search":
                     if _scopus_ok and effective_doi:
                         status_text.text(f"Scopus: {user_id[:50]}...")
                         try:
-                            s = process_doi_scopus(effective_doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                            s = process_doi_scopus(
+                                effective_doi,
+                                SCOPUS_API_KEY,
+                                SCOPUS_INST_TOKEN,
+                                fetch_exclude_self=unified_scopus_excl,
+                            )
                             scopus_bundle = s
                             row["Title"] = row["Title"] if row["Title"] != "N/A" else s.get("Title", "N/A")
                             row["Scopus Total Citations"] = s.get("Total Citations", "N/A")
@@ -5114,8 +5139,9 @@ elif app_mode == "Scopus":
         )
 
         if scopus_search_mode == "Citation finder (by DOI)":
-            st.markdown("Fetch **citation metrics** (total and exclude self-citations) by **DOI**.")
+            st.markdown("Fetch **citation metrics** by **DOI** (total; exclude-self optional).")
             st.caption("Paste DOIs (one per line) or upload a CSV/Excel file with a DOI column.")
+            _render_scopus_citation_quota_option("scopus")
             _render_scival_fwci_options("scopus")
             raw_dois = st.text_area("📋 Paste DOIs (one per line)", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
             uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
@@ -5150,10 +5176,16 @@ elif app_mode == "Scopus":
                     scopus_scival_details = bool(st.session_state.get("scopus_scival_details"))
                     scopus_scival_sdg = bool(st.session_state.get("scopus_scival_sdg"))
                     scopus_scival_any = _scival_options_enabled("scopus")
-                    sleep_time = 1.6 if scopus_scival_any else 1.25
+                    scopus_excl_self = _scopus_citations_exclude_self_enabled("scopus")
+                    sleep_time = 1.6 if scopus_scival_any else (1.0 if not scopus_excl_self else 1.25)
                     for i, doi in enumerate(all_dois):
                         status_text.text(f"Fetching {i+1} of {len(all_dois)}: {doi}")
-                        result = process_doi_scopus(doi, SCOPUS_API_KEY, SCOPUS_INST_TOKEN)
+                        result = process_doi_scopus(
+                            doi,
+                            SCOPUS_API_KEY,
+                            SCOPUS_INST_TOKEN,
+                            fetch_exclude_self=scopus_excl_self,
+                        )
                         if scopus_scival_any:
                             if include_fwci:
                                 result["FWCI"] = "N/A"
@@ -5192,7 +5224,9 @@ elif app_mode == "Scopus":
                         row.pop("_scopus_pub_id", None)
                         row.pop("_scopus_pub_year", None)
                     df_results = pd.DataFrame(results_list)
-                    export_cols = ["DOI", "Title", "Year", "Total Citations", "Exclude self-citations"]
+                    export_cols = ["DOI", "Title", "Year", "Total Citations"]
+                    if scopus_excl_self:
+                        export_cols.append("Exclude self-citations")
                     if include_fwci:
                         export_cols.extend(["FWCI", "FWCI Status"])
                     if scopus_scival_details:
