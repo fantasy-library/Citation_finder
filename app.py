@@ -210,16 +210,19 @@ if "api_keys_errors" not in st.session_state:
 # ==========================================
 _icons_dir = Path(__file__).resolve().parent / "icons"
 st.sidebar.markdown("### 🔑 Step 1: API keys")
+st.sidebar.caption(
+    "Download the template, paste your keys, save as `.txt`, then upload that file here "
+    "(a few lines of text—not a large data export)."
+)
 
 # 1) Drag and drop file first
 uploaded_keys_file = st.sidebar.file_uploader(
-    "Drag and drop file here",
+    "Upload API keys file (.txt)",
     type=["txt", "env"],
     key="api_keys_upload",
-    label_visibility="collapsed",
+    label_visibility="visible",
+    help="Use the template from the button below. Only plain text key=value lines.",
 )
-if uploaded_keys_file is None:
-    st.sidebar.caption("No file chosen")
 
 # 2) Download template below
 template_content = get_api_keys_template_content()
@@ -4012,12 +4015,11 @@ st.markdown("""
     /* ----- Divider ----- */
     hr { margin: 1.25rem 0 !important; border-color: #e2e8f0 !important; }
 
-    /* ----- Hide file uploader limit text ----- */
-    [data-testid="stFileUploader"] small,
-    [data-testid="stFileUploader"] [class*="caption"],
-    [data-testid="stFileUploader"] p,
-    [data-testid="stFileUploader"] [class*="help"],
-    [data-testid="stFileUploader"] [class*="limit"] { display: none !important; }
+    /* Hide Streamlit default "200MB per file • …" line; we explain upload in our own captions */
+    [data-testid="stFileUploaderDropzoneInstructions"],
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"] {
+        display: none !important;
+    }
 
     /* ----- Step 1 API keys: card-style layout and drop zone ----- */
     [data-testid="stSidebar"] [data-testid="stFileUploader"] {
@@ -4058,43 +4060,6 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
-
-# Hide file uploader "Limit 200MB per file • TXT, ENV" via JS (runs in iframe, modifies parent DOM)
-_hide_uploader_limit_script = """
-<script>
-(function() {
-  var doc = window.parent && window.parent.document ? window.parent.document : document;
-  function hideLimit() {
-    try {
-      var uploaders = doc.querySelectorAll('[data-testid="stFileUploader"]');
-      for (var i = 0; i < uploaders.length; i++) {
-        var walk = function(node) {
-          if (node.nodeType === Node.TEXT_NODE && node.textContent && /Limit|200MB|per file|TXT.*ENV/.test(node.textContent)) {
-            if (node.parentElement) node.parentElement.style.setProperty('display', 'none', 'important');
-            return;
-          }
-          for (var j = 0; j < node.childNodes.length; j++) walk(node.childNodes[j]);
-        };
-        walk(uploaders[i]);
-      }
-    } catch (e) {}
-  }
-  if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', hideLimit);
-  else hideLimit();
-  setTimeout(hideLimit, 400);
-  setTimeout(hideLimit, 1200);
-})();
-</script>
-"""
-# st.components.v1.html is removed after 2026-06-01; st.iframe is the replacement.
-# st.iframe rejects height=0, so size the frame to its (empty) content.
-# Older Streamlit releases only have the components helper, which does allow 0.
-if hasattr(st, "iframe"):
-    st.iframe(_hide_uploader_limit_script, width="content", height="content")
-else:
-    import streamlit.components.v1 as components
-
-    components.html(_hide_uploader_limit_script, height=0)
 
 st.sidebar.markdown("---")
 st.sidebar.caption("🔐 Keys are used only in this session and are not stored on disk.")
@@ -5140,11 +5105,16 @@ elif app_mode == "Scopus":
 
         if scopus_search_mode == "Citation finder (by DOI)":
             st.markdown("Fetch **citation metrics** by **DOI** (total; exclude-self optional).")
-            st.caption("Paste DOIs (one per line) or upload a CSV/Excel file with a DOI column.")
+            st.caption("Paste DOIs (one per line) or upload a spreadsheet with a DOI column.")
             _render_scopus_citation_quota_option("scopus")
             _render_scival_fwci_options("scopus")
             raw_dois = st.text_area("📋 Paste DOIs (one per line)", height=200, placeholder="10.5194/bg-18-2755-2021\n10.3389/fmars.2021.615929", key="scopus_bulk_dois")
-            uploaded_file = st.file_uploader("📎 Or upload file (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="scopus_upload")
+            st.caption("Spreadsheet upload: `.csv` or `.xlsx` with a column named DOI (or similar).")
+            uploaded_file = st.file_uploader(
+                "📎 Or upload DOI list (.csv, .xlsx)",
+                type=["csv", "xlsx", "xls"],
+                key="scopus_upload",
+            )
 
             _c1, _c2, _c3 = st.columns([1, 1, 1])
             with _c2:
