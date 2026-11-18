@@ -1,0 +1,69 @@
+{
+  "id": "https://openalex.org/W123",
+  "doi": "https://doi.org/10.7717/peerj.4375",
+  "title": "Sample work for unit tests",
+  "publication_year": 2014,
+  "publication_date": "2014-12-18",
+  "type": "article",
+  "type_crossref": "journal-article",
+  "cited_by_count": 382,
+  "fwci": 12.5,
+  "citation_normalized_percentile": {
+    "value": 0.999948,
+    "is_in_top_1_percent": true,
+    "is_in_top_10_percent": true
+  },
+  "primary_location": {
+    "source": {
+      "display_name": "PeerJ"
+    }
+  },
+  "open_access": {
+    "is_oa": true,
+    "oa_status": "gold",
+    "oa_url": "https://peerj.com/articles/4375.pdf"
+  },
+  "primary_topic": {
+    "display_name": "Marine ecology studies"
+  },
+  "topics": [
+    {"display_name": "Marine ecology studies"},
+    {"display_name": "Coral reef biodiversity"}
+  ],
+  "authorships": [
+    {
+      "author": {"display_name": "Alice Author"},
+      "is_corresponding": true,
+      "institutions": [
+        {"display_name": "Test University", "country_code": "US"}
+      ]
+    },
+    {
+      "author": {"display_name": "Bob Coauthor"},
+      "is_corresponding": false,
+      "institutions": [
+        {"display_name": "Other Institute", "country_code": "GB"}
+      ]
+    }
+  ],
+  "authors_count": 2,
+  "countries_distinct_count": 2,
+  "ids": {
+    "pmid": "https://pubmed.ncbi.nlm.nih.gov/25505056",
+    "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4275199"
+  },
+  "grants": [
+    {
+      "funder_display_name": "National Science Foundation",
+      "award_id": "ABI 1661218"
+    }
+  ],
+  "is_retracted": false,
+  "sustainable_development_goals": [
+    {
+      "id": "https://metadata.un.org/sdg/14",
+      "display_name": "Life below water",
+      "score": 0.65
+    }
+  ]
+}

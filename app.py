@@ -63,6 +63,9 @@ _scival_optional_row_columns = _fwci_lib._scival_optional_row_columns
 _fwci_help_text = _fwci_lib._fwci_help_text
 _SCIVAL_FWCI_LEARN_MORE = _fwci_lib._SCIVAL_FWCI_LEARN_MORE
 
+import wos_incites_lib as _wos_incites_lib
+import openalex_lib as _openalex_lib
+
 
 def fetch_doi_scival_cached(
     doi, api_key, inst_token, publication_id=None, publication_year=None
@@ -138,13 +141,23 @@ CHECKPOINT_SCOPE = str(_scope_param)
 # Default from secrets (optional)
 try:
     _default_inst_token = st.secrets.get("SCOPUS_INST_TOKEN", "")
+    _default_openalex_key = st.secrets.get("OPENALEX_API_KEY", "")
 except Exception:
     _default_inst_token = ""
+    _default_openalex_key = ""
 
 # ==========================================
 # API KEYS – Template & file parsing
 # ==========================================
-ALLOWED_API_KEYS = ("WOS_API_KEY", "WOS_JOURNAL_API_KEY", "SCOPUS_API_KEY", "SCOPUS_INST_TOKEN", "SERPAPI_KEY")
+ALLOWED_API_KEYS = (
+    "WOS_API_KEY",
+    "WOS_JOURNAL_API_KEY",
+    "INCITES_API_KEY",
+    "OPENALEX_API_KEY",
+    "SCOPUS_API_KEY",
+    "SCOPUS_INST_TOKEN",
+    "SERPAPI_KEY",
+)
 
 
 def get_api_keys_template_content():
@@ -160,6 +173,8 @@ def get_api_keys_template_content():
 
 WOS_API_KEY=
 WOS_JOURNAL_API_KEY=
+INCITES_API_KEY=
+OPENALEX_API_KEY=
 SCOPUS_API_KEY=
 SCOPUS_INST_TOKEN=
 SERPAPI_KEY=
@@ -256,6 +271,18 @@ with st.sidebar.expander("✏️ Enter keys manually"):
     with st.form("manual_api_keys_form", clear_on_submit=False):
         manual_wos = st.text_input("WOS API key", type="password", placeholder="WOS key", key="manual_wos")
         manual_wos_j = st.text_input("WOS Journal API key (optional)", type="password", placeholder="WOS Journal key", key="manual_wos_j")
+        manual_incites = st.text_input(
+            "InCites API key (optional)",
+            type="password",
+            placeholder="If different from WoS key",
+            key="manual_incites",
+        )
+        manual_openalex = st.text_input(
+            "OpenAlex API key (optional)",
+            type="password",
+            placeholder="Free key for large SDG batches",
+            key="manual_openalex",
+        )
         manual_scopus = st.text_input("Scopus API key", type="password", placeholder="Scopus key", key="manual_scopus")
         manual_inst = st.text_input("Scopus institutional token", type="password", placeholder="Institutional token", key="manual_inst")
         manual_serp = st.text_input("SerpAPI key", type="password", placeholder="SerpAPI key", key="manual_serp")
@@ -266,6 +293,10 @@ with st.sidebar.expander("✏️ Enter keys manually"):
                 keys["WOS_API_KEY"] = manual_wos.strip()
             if manual_wos_j and manual_wos_j.strip():
                 keys["WOS_JOURNAL_API_KEY"] = manual_wos_j.strip()
+            if manual_incites and manual_incites.strip():
+                keys["INCITES_API_KEY"] = manual_incites.strip()
+            if manual_openalex and manual_openalex.strip():
+                keys["OPENALEX_API_KEY"] = manual_openalex.strip()
             if manual_scopus and manual_scopus.strip():
                 keys["SCOPUS_API_KEY"] = manual_scopus.strip()
             if manual_inst and manual_inst.strip():
@@ -280,6 +311,8 @@ with st.sidebar.expander("✏️ Enter keys manually"):
 _keys = st.session_state.get("api_keys", {})
 WOS_API_KEY = _keys.get("WOS_API_KEY", "").strip()
 WOS_JOURNAL_API_KEY = (_keys.get("WOS_JOURNAL_API_KEY") or "").strip()
+INCITES_API_KEY = (_keys.get("INCITES_API_KEY") or "").strip()
+OPENALEX_API_KEY = (_keys.get("OPENALEX_API_KEY") or _default_openalex_key or "").strip()
 SCOPUS_API_KEY = (_keys.get("SCOPUS_API_KEY") or "").strip()
 SCOPUS_INST_TOKEN = (_keys.get("SCOPUS_INST_TOKEN") or _default_inst_token or "").strip()
 SERPAPI_KEY = (_keys.get("SERPAPI_KEY") or "").strip()
@@ -295,6 +328,11 @@ _wos_ok, _scopus_ok, _gs_ok = _platform_status()
 st.sidebar.markdown(
     f"**Platforms:** WOS {'✓' if _wos_ok else '—'} · Scopus {'✓' if _scopus_ok else '—'} · Google Scholar {'✓' if _gs_ok else '—'}"
 )
+if _wos_ok:
+    st.sidebar.caption(
+        "InCites SDGs (optional) use Document Level Metrics (~2000 calls/day, 2/sec). "
+        "Uses INCITES_API_KEY when set, otherwise your WoS key."
+    )
 if _scopus_ok:
     with st.sidebar.expander("📊 Scopus weekly API quota", expanded=False):
         st.caption(
@@ -347,16 +385,28 @@ except Exception:
     pass
 app_mode = st.sidebar.radio(
     "Mode",
-    ["Unified citation search", "Web of Science", "Scopus", "Google Scholar", "Crossref"],
+    [
+        "Unified citation search",
+        "Web of Science",
+        "Scopus",
+        "Google Scholar",
+        "Crossref",
+        "OpenAlex SDGs",
+    ],
     format_func=lambda x: {
         "Unified citation search": "🔍 Unified (WOS + Scopus + Google Scholar)",
         "Web of Science": "📚 Web of Science",
         "Scopus": "📈 Scopus",
         "Google Scholar": "🎓 Google Scholar",
         "Crossref": "🔗 Crossref",
+        "OpenAlex SDGs": "🌍 OpenAlex SDGs",
     }[x],
     key="app_mode_radio",
 )
+if app_mode == "OpenAlex SDGs":
+    st.sidebar.caption(
+        "OpenAlex SDG mode: no WOS/Scopus keys required. Optional OPENALEX_API_KEY for large lists."
+    )
 
 # Unlock logic per mode
 if app_mode == "Unified citation search":
@@ -373,6 +423,9 @@ elif app_mode == "Scopus":
     api_reminder = "Please add your Scopus API key and institutional token in Step 1 to unlock the search."
 elif app_mode == "Crossref":
     api_unlocked = True  # No API key required
+    api_reminder = ""
+elif app_mode == "OpenAlex SDGs":
+    api_unlocked = True
     api_reminder = ""
 else:
     api_unlocked = False
@@ -596,6 +649,95 @@ def fetch_wos_data(wos_ids, progress_bar, status_text, wos_api_key=None):
         time.sleep(1)  # Rate limit protection
 
     return results
+
+
+def _incites_api_key_effective():
+    return _wos_incites_lib.resolve_incites_api_key(WOS_API_KEY, INCITES_API_KEY)
+
+
+def _enrich_wos_rows_with_incites_sdgs(rows, status_text=None):
+    """Attach InCites SDG columns using WoS UTs already on each successful row."""
+    if not rows:
+        return rows
+    api_key = _incites_api_key_effective()
+    if not api_key:
+        for row in rows:
+            row["InCites SDGs"] = "N/A"
+            row["Status (InCites SDG)"] = "Missing WoS/InCites API key"
+        return rows
+
+    uts = []
+    ut_to_indices = {}
+    for idx, row in enumerate(rows):
+        if row.get("Status") != "Success":
+            row.update(_wos_incites_lib.incites_sdg_row_columns("N/A", "WoS lookup failed"))
+            continue
+        ut = _wos_incites_lib.normalize_wos_ut(row.get("Unique WOS ID"))
+        if not ut:
+            row.update(_wos_incites_lib.incites_sdg_row_columns("N/A", "No WoS UT"))
+            continue
+        uts.append(ut)
+        ut_to_indices.setdefault(ut, []).append(idx)
+
+    if status_text is not None:
+        status_text.text(f"InCites SDGs: fetching for {len(uts)} WoS record(s)…")
+    sdgs_map, meta = _wos_incites_lib.fetch_incites_sdgs_for_uts(uts, api_key)
+    global_err = meta.get("error")
+    for ut, indices in ut_to_indices.items():
+        labels = sdgs_map.get(ut, [])
+        for idx in indices:
+            if global_err and ut not in sdgs_map:
+                rows[idx].update(_wos_incites_lib.incites_sdg_row_columns("N/A", global_err))
+            elif labels:
+                rows[idx].update(
+                    _wos_incites_lib.incites_sdg_row_columns(
+                        _wos_incites_lib.format_incites_sdg_cell(labels),
+                        "Success",
+                    )
+                )
+            else:
+                rows[idx].update(
+                    _wos_incites_lib.incites_sdg_row_columns(
+                        "N/A",
+                        "No InCites SDG mapping for this record",
+                    )
+                )
+    return rows
+
+
+def _apply_incites_sdg_for_wos_row(row, wos_record, status_text=None):
+    """Single-row InCites SDG lookup after a WoS Starter hit (Unified flow)."""
+    api_key = _incites_api_key_effective()
+    ut = _wos_incites_lib.normalize_wos_ut(
+        (wos_record or {}).get("Unique WOS ID") if isinstance(wos_record, dict) else None
+    )
+    if not wos_record or wos_record.get("Status") != "Success" or not ut:
+        row.update(_wos_incites_lib.incites_sdg_row_columns("N/A", "WoS record required"))
+        return row
+    if not api_key:
+        row.update(_wos_incites_lib.incites_sdg_row_columns("N/A", "Missing WoS/InCites API key"))
+        return row
+    if status_text is not None:
+        status_text.text(f"InCites SDGs: {ut[:24]}…")
+    sdgs_map, meta = _wos_incites_lib.fetch_incites_sdgs_for_uts([ut], api_key)
+    labels = sdgs_map.get(ut, [])
+    if meta.get("error"):
+        row.update(_wos_incites_lib.incites_sdg_row_columns("N/A", meta["error"]))
+    elif labels:
+        row.update(
+            _wos_incites_lib.incites_sdg_row_columns(
+                _wos_incites_lib.format_incites_sdg_cell(labels),
+                "Success",
+            )
+        )
+    else:
+        row.update(
+            _wos_incites_lib.incites_sdg_row_columns(
+                "N/A",
+                "No InCites SDG mapping for this record",
+            )
+        )
+    return row
 
 
 # ==========================================
@@ -4109,6 +4251,21 @@ def _render_scopus_citation_quota_option(key_prefix):
     )
 
 
+def _render_incites_sdg_option(key_prefix):
+    """Optional InCites SDG tags (WoS UT + InCites schema=sdg)."""
+    if not _wos_ok:
+        return
+    st.checkbox(
+        "🌍 InCites SDGs (WoS / Clarivate)",
+        value=False,
+        key=f"{key_prefix}_incites_sdg",
+        help=(
+            "Resolves each DOI to a WoS accession number, then calls InCites Document Level Metrics "
+            "(SDG schema). Requires InCites access on your API key (or a separate INCITES_API_KEY)."
+        ),
+    )
+
+
 def _render_scival_fwci_options(key_prefix):
     """SciVal FWCI + optional publication metadata columns (same API response)."""
     with st.container(border=True):
@@ -4631,6 +4788,8 @@ if app_mode == "Unified citation search":
         if _scopus_ok:
             _render_scopus_citation_quota_option("unified")
             _render_scival_fwci_options("unified")
+        if _wos_ok:
+            _render_incites_sdg_option("unified")
         raw_input = st.text_area(
             "📋 Paste DOIs (one per line)",
             height=200,
@@ -4693,10 +4852,16 @@ if app_mode == "Unified citation search":
                 unified_scival_details = bool(_scopus_ok and st.session_state.get("unified_scival_details"))
                 unified_scival_sdg = bool(_scopus_ok and st.session_state.get("unified_scival_sdg"))
                 unified_scival_any = _scopus_ok and _scival_options_enabled("unified")
+                unified_incites_sdg = bool(_wos_ok and st.session_state.get("unified_incites_sdg"))
                 unified_scopus_excl = _scopus_citations_exclude_self_enabled("unified")
                 _fwci_steps = 1 if unified_scival_any else 0
+                _incites_steps = 1 if unified_incites_sdg else 0
                 total_steps = len(identifiers) * (
-                    (_wos_ok and 1 or 0) + (_scopus_ok and 1 or 0) + _fwci_steps + (_gs_ok and 1 or 0)
+                    (_wos_ok and 1 or 0)
+                    + _incites_steps
+                    + (_scopus_ok and 1 or 0)
+                    + _fwci_steps
+                    + (_gs_ok and 1 or 0)
                 )
                 if total_steps == 0:
                     total_steps = 1
@@ -4720,18 +4885,25 @@ if app_mode == "Unified citation search":
                             row["Scopus FWCI"] = "N/A"
                             row["FWCI Status"] = "N/A"
                         row.update(_scival_optional_row_columns(None, unified_scival_details, unified_scival_sdg))
+                    if unified_incites_sdg:
+                        row.update(_wos_incites_lib.incites_sdg_row_columns("N/A", "N/A"))
                     effective_doi = doi if doi and str(doi).startswith("10.") else None
                     scopus_bundle = {}
                     if _wos_ok and effective_doi:
                         status_text.text(f"WOS: {user_id[:50]}...")
                         wos_list = fetch_wos_data([effective_doi], progress_bar, status_text, wos_api_key=WOS_API_KEY)
-                        if wos_list:
-                            w = wos_list[0]
-                            row["Title"] = w.get("Title", "N/A")
-                            row["WOS Citation Count"] = w.get("Citation Count", "N/A")
-                            row["Status (WOS)"] = w.get("Status", "N/A")
+                        w_wos = wos_list[0] if wos_list else None
+                        if w_wos:
+                            row["Title"] = w_wos.get("Title", "N/A")
+                            row["WOS Citation Count"] = w_wos.get("Citation Count", "N/A")
+                            row["Status (WOS)"] = w_wos.get("Status", "N/A")
                         step += 1
                         progress_bar.progress(min(step / total_steps, 1.0))
+                        if unified_incites_sdg and w_wos:
+                            _apply_incites_sdg_for_wos_row(row, w_wos, status_text)
+                            step += 1
+                            progress_bar.progress(min(step / total_steps, 1.0))
+                            time.sleep(0.55)
                     if _scopus_ok and effective_doi:
                         status_text.text(f"Scopus: {user_id[:50]}...")
                         try:
@@ -4822,6 +4994,7 @@ elif app_mode == "Web of Science":
         if wos_search_mode == "Citation finder (by WOS ID or DOI)":
             st.markdown("Fetch article metadata, authors, and citation counts by **WOS ID** or **DOI**.")
             st.caption("Paste one identifier per line (e.g. `WOS:000267144200002` or `10.3390/cancers16050984`).")
+            _render_incites_sdg_option("wos")
             raw_wos_text = st.text_area(
                 "📋 Paste WOS IDs or DOIs (one per line)",
                 height=200,
@@ -4844,6 +5017,8 @@ elif app_mode == "Web of Science":
                     status_text = st.empty()
 
                     wos_data = fetch_wos_data(wos_ids, progress_bar, status_text)
+                    if st.session_state.get("wos_incites_sdg"):
+                        wos_data = _enrich_wos_rows_with_incites_sdgs(wos_data, status_text)
 
                     success_count = sum(1 for r in wos_data if r.get("Status") == "Success")
                     status_text.success(f"✅ Finished processing {len(wos_data)} records!")
@@ -5444,6 +5619,112 @@ elif app_mode == "Google Scholar":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="gs_download_btn",
                 )
+
+elif app_mode == "OpenAlex SDGs":
+    st.title("OpenAlex work lookup")
+    st.markdown(
+        "Fetch **OpenAlex** metadata by DOI: citations, **OpenAlex FWCI** (not SciVal FWCI), "
+        "open access, topics, authors, IDs, grants, retraction, and **SDG** tags (scores **≥ 0.4**)."
+    )
+    st.caption(
+        "No WOS/Scopus keys required. Optional **OPENALEX_API_KEY** in Step 1 helps with large lists. "
+        "Empty SDGs do not prove a paper is unrelated to SDGs—it may be unclassified or below threshold."
+    )
+
+    def _openalex_packs_from_session():
+        return {
+            "citations_impact": bool(st.session_state.get("openalex_pack_citations_impact", True)),
+            "bibliographic": bool(st.session_state.get("openalex_pack_bibliographic", True)),
+            "open_access": bool(st.session_state.get("openalex_pack_open_access", True)),
+            "topics": bool(st.session_state.get("openalex_pack_topics", True)),
+            "authors": bool(st.session_state.get("openalex_pack_authors", True)),
+            "ids_grants": bool(st.session_state.get("openalex_pack_ids_grants", True)),
+            "sdgs": bool(st.session_state.get("openalex_pack_sdgs", True)),
+            "retraction": bool(st.session_state.get("openalex_pack_retraction", True)),
+            "openalex_url": bool(st.session_state.get("openalex_pack_openalex_url", True)),
+        }
+
+    with st.expander("Fields to include", expanded=True):
+        st.checkbox(
+            "Citations & impact (count, OpenAlex FWCI, citation percentile)",
+            value=True,
+            key="openalex_pack_citations_impact",
+        )
+        st.checkbox(
+            "Bibliographic (publication date, type, source / journal)",
+            value=True,
+            key="openalex_pack_bibliographic",
+        )
+        st.checkbox("Open access (status, URL)", value=True, key="openalex_pack_open_access")
+        st.checkbox("Topics (primary + all)", value=True, key="openalex_pack_topics")
+        st.checkbox(
+            "Authors & institutions",
+            value=True,
+            key="openalex_pack_authors",
+        )
+        st.checkbox("External IDs & grants (PMID, PMCID, funders)", value=True, key="openalex_pack_ids_grants")
+        st.checkbox(
+            "SDG tags (OpenAlex sustainable_development_goals)",
+            value=True,
+            key="openalex_pack_sdgs",
+        )
+        st.checkbox("Retraction flag", value=True, key="openalex_pack_retraction")
+        st.checkbox("OpenAlex record URL", value=True, key="openalex_pack_openalex_url")
+
+    raw_openalex = st.text_area(
+        "📋 Paste DOIs (one per line)",
+        height=220,
+        placeholder="10.7717/peerj.4375\nhttps://doi.org/10.1038/nature11018",
+        key="openalex_sdg_input",
+    )
+    _oa1, _oa2, _oa3 = st.columns([1, 1, 1])
+    with _oa2:
+        _openalex_clicked = st.button(
+            "🔍 Fetch OpenAlex data",
+            type="primary",
+            use_container_width=True,
+            key="openalex_sdg_btn",
+        )
+    if _openalex_clicked:
+        lines = [ln.strip() for ln in (raw_openalex or "").splitlines() if ln.strip()]
+        if not lines:
+            st.warning("Enter at least one DOI.")
+        else:
+            max_n = 200
+            if len(lines) > max_n:
+                st.warning(f"Processing the first {max_n} of {len(lines)} DOIs.")
+                lines = lines[:max_n]
+            _packs = _openalex_packs_from_session()
+            st.session_state["openalex_export_packs"] = _packs
+            progress_oa = st.progress(0)
+            status_oa = st.empty()
+            rows = []
+            for i, line in enumerate(lines, 1):
+                status_oa.text(f"OpenAlex {i}/{len(lines)}: {line[:55]}…")
+                rows.append(_openalex_lib.build_openalex_work_row(line, OPENALEX_API_KEY, include=_packs))
+                progress_oa.progress(i / len(lines))
+                time.sleep(0.25)
+            status_oa.success(f"✅ Finished {len(rows)} DOI(s).")
+            export_cols = _openalex_lib.openalex_export_column_order(_packs)
+            df_openalex = pd.DataFrame(rows)[export_cols]
+            st.session_state["openalex_sdg_df"] = df_openalex
+
+    if "openalex_sdg_df" in st.session_state:
+        st.divider()
+        _show_df = st.session_state["openalex_sdg_df"]
+        _packs_show = st.session_state.get("openalex_export_packs") or _openalex_packs_from_session()
+        _cols = _openalex_lib.openalex_export_column_order(_packs_show)
+        _cols = [c for c in _cols if c in _show_df.columns]
+        if _cols:
+            _show_df = _show_df[_cols]
+        st.dataframe(_show_df, width="stretch")
+        st.download_button(
+            label="📥 Download results (.xlsx)",
+            data=to_excel(_show_df),
+            file_name="openalex_work_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="openalex_sdg_download_btn",
+        )
 
 elif app_mode == "Crossref":
     _cr_icon_path = _icons_dir / "Crossref.png"

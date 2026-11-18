@@ -1,0 +1,24 @@
+{
+  "api": [
+    {
+      "rval": [
+        {
+          "ACCESSION_NUMBER": ["000259986300005"],
+          "DOCUMENT_TYPE": ["Article"],
+          "PERCENTILE": [
+            {
+              "CODE": "3",
+              "SUBJECT": "Good Health and Well-Being",
+              "CAT_PERC": "92.1"
+            },
+            {
+              "CODE": "16",
+              "SUBJECT": "Peace, Justice and Strong Institutions",
+              "CAT_PERC": "88.0"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
