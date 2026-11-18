@@ -13,8 +13,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 OPENALEX_WORKS_API = "https://api.openalex.org/works"
-REQUEST_TIMEOUT = 20
-OPENALEX_LIB_VERSION = "2026.04"
+REQUEST_TIMEOUT = 25
+OPENALEX_LIB_VERSION = "2026.05"
+OPENALEX_USER_AGENT = (
+    "AcademicDatabaseSearch/1.0 "
+    "(https://github.com/fantasy-library/Citation_finder; openalex-doi-lookup)"
+)
 
 OPENALEX_SDG_SELECT = "id,doi,title,publication_year,sustainable_development_goals"
 OPENALEX_WORK_SELECT = ",".join(
@@ -74,7 +78,7 @@ def normalize_doi(value: str) -> str:
     doi = value.strip()
     doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.I)
     doi = re.sub(r"^doi:\s*", "", doi, flags=re.I)
-    doi = doi.strip()
+    doi = doi.strip().rstrip(".,;)")
     if not re.fullmatch(r"10\.\d{4,9}/\S+", doi, flags=re.I):
         raise ValueError("Invalid DOI format (expected e.g. 10.7717/peerj.4375).")
     return doi
@@ -152,51 +156,126 @@ def _openalex_error_detail(response: requests.Response) -> str:
     return (response.text or "")[:200]
 
 
+def _openalex_headers() -> Dict[str, str]:
+    return {"User-Agent": OPENALEX_USER_AGENT, "Accept": "application/json"}
+
+
+def _openalex_get(url: str, params: Optional[Dict[str, str]]) -> requests.Response:
+    return _SESSION.get(
+        url,
+        params=params if params else None,
+        headers=_openalex_headers(),
+        timeout=REQUEST_TIMEOUT,
+    )
+
+
+def _parse_single_work_response(response: requests.Response) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if response.status_code == 404:
+        return None, None
+    if response.status_code == 429:
+        return None, "OpenAlex rate limit (429); retry later or add a free API key"
+    if response.status_code in (401, 403):
+        detail = _openalex_error_detail(response)
+        return None, f"OpenAlex API key rejected ({response.status_code}): {detail}"
+    if response.status_code != 200:
+        detail = _openalex_error_detail(response)
+        return None, f"OpenAlex HTTP {response.status_code}: {detail or 'unknown error'}"
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, "OpenAlex returned non-JSON response"
+    if isinstance(payload, dict) and payload.get("results") is not None:
+        results = payload.get("results") or []
+        if not results:
+            return None, None
+        first = results[0]
+        return (first if isinstance(first, dict) else None), None
+    if isinstance(payload, dict):
+        return payload, None
+    return None, "Unexpected OpenAlex response shape"
+
+
+def _fetch_work_via_filter(normalized: str, api_key: str, select: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Fallback when singleton DOI URLs fail."""
+    filters = (
+        f"doi:{normalized}",
+        f"doi:https://doi.org/{normalized}",
+    )
+    last_err: Optional[str] = None
+    for doi_filter in filters:
+        for key in ([api_key, ""] if api_key else [""]):
+            params: Dict[str, str] = {"filter": doi_filter, "per_page": "1"}
+            if select:
+                params["select"] = select
+            if key:
+                params["api_key"] = key
+            response = _openalex_get(OPENALEX_WORKS_API, params)
+            work, err = _parse_single_work_response(response)
+            if work is not None:
+                return work, None
+            if err and response.status_code not in (400, 401, 403):
+                return None, err
+            last_err = err or last_err
+    return None, last_err
+
+
 def get_openalex_work_by_doi(
     doi: str,
     api_key: str = "",
     *,
-    select: Optional[str] = OPENALEX_WORK_SELECT,
+    select: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Fetch one OpenAlex work by DOI.
     Returns (work_json, error_message). error_message is set on HTTP/client failures.
+
+    Default is no ``select`` (full work JSON) — singleton lookups are free and avoid
+    invalid/oversized ``select`` strings that can cause HTTP 400.
     """
     try:
         normalized = normalize_doi(doi)
     except ValueError as exc:
         return None, str(exc)
 
-    url = f"{OPENALEX_WORKS_API}/doi:{quote(normalized, safe='/')}"
-    params: Dict[str, str] = {}
-    if select:
-        params["select"] = select
     key = (api_key or "").strip()
-    if key:
-        params["api_key"] = key
+    encoded = quote(normalized, safe="/")
+    singleton_urls = (
+        f"{OPENALEX_WORKS_API}/doi:{encoded}",
+        f"{OPENALEX_WORKS_API}/https://doi.org/{encoded}",
+    )
+
+    key_attempts = [key] if key else []
+    key_attempts.append("")
+    select_attempts: List[Optional[str]] = [None]
+    if select:
+        select_attempts.insert(0, select)
+
+    last_err: Optional[str] = None
     try:
-        response = _SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code == 404:
-            return None, None
-        if response.status_code == 429:
-            return None, "OpenAlex rate limit (429); retry later or add a free API key"
-        if response.status_code in (401, 403):
-            return None, f"OpenAlex API key rejected ({response.status_code})"
-        if response.status_code == 400 and select:
-            fallback: Dict[str, str] = {}
-            if key:
-                fallback["api_key"] = key
-            response_fb = _SESSION.get(url, params=fallback or None, timeout=REQUEST_TIMEOUT)
-            if response_fb.status_code == 200:
-                return response_fb.json(), None
-            detail = _openalex_error_detail(response_fb if response_fb.status_code == 400 else response)
-            return None, f"OpenAlex HTTP 400: {detail}"
-        if response.status_code == 400:
-            return None, f"OpenAlex HTTP 400: {_openalex_error_detail(response)}"
-        if response.status_code != 200:
-            detail = _openalex_error_detail(response)
-            return None, f"OpenAlex HTTP {response.status_code}: {detail}"
-        return response.json(), None
+        for use_key in key_attempts:
+            for url in singleton_urls:
+                for use_select in select_attempts:
+                    params: Dict[str, str] = {}
+                    if use_select:
+                        params["select"] = use_select
+                    if use_key:
+                        params["api_key"] = use_key
+                    response = _openalex_get(url, params)
+                    work, err = _parse_single_work_response(response)
+                    if work is not None:
+                        return work, None
+                    if response.status_code == 404:
+                        continue
+                    if err:
+                        last_err = err
+                    if response.status_code in (400, 401, 403) and use_key:
+                        continue
+        work, err = _fetch_work_via_filter(normalized, key, None)
+        if work is not None:
+            return work, None
+        if err:
+            last_err = err
+        return None, last_err
     except requests.RequestException as exc:
         return None, f"OpenAlex request failed: {str(exc)[:100]}"
 
@@ -484,7 +563,7 @@ def build_openalex_work_row(
             include=packs,
             lookup_status=str(exc)[:80],
         )
-    work, err = get_openalex_work_by_doi(normalized, api_key, select=OPENALEX_WORK_SELECT)
+    work, err = get_openalex_work_by_doi(normalized, api_key, select=None)
     if err:
         return parse_work_export_row(None, normalized, include=packs, lookup_status=err)
     if work is None:
@@ -518,7 +597,7 @@ def build_openalex_sdg_result_row(doi: str, api_key: str = "") -> Dict[str, str]
 
 def fetch_openalex_sdgs_by_doi(doi: str, api_key: str = "") -> Tuple[str, str]:
     """Lookup stored OpenAlex SDG tags for a DOI. Returns (sdgs_cell, status_message)."""
-    work, err = get_openalex_work_by_doi(doi, api_key, select=OPENALEX_SDG_SELECT)
+    work, err = get_openalex_work_by_doi(doi, api_key, select=None)
     if err:
         return "N/A", err
     if work is None:

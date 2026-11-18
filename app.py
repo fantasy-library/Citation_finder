@@ -5627,8 +5627,9 @@ elif app_mode == "OpenAlex SDGs":
         "open access, topics, authors, IDs, grants, retraction, and **SDG** tags (scores **≥ 0.4**)."
     )
     st.caption(
-        "No WOS/Scopus keys required. Optional **OPENALEX_API_KEY** in Step 1 helps with large lists. "
-        "Empty SDGs do not prove a paper is unrelated to SDGs—it may be unclassified or below threshold."
+        "No WOS/Scopus keys required. **OPENALEX_API_KEY** is optional (large lists); remove it from Step 1 "
+        "if you see key-related errors. Empty SDGs do not prove a paper is unrelated to SDGs—it may be "
+        "unclassified or below the 0.4 threshold."
     )
 
     def _openalex_packs_from_session():

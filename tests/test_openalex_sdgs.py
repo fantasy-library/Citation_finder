@@ -6,6 +6,7 @@ import openalex_lib as lib
 
 class OpenAlexSdgTests(unittest.TestCase):
     def test_normalize_doi(self):
+        self.assertEqual(lib.normalize_doi("10.7717/peerj.4375."), "10.7717/peerj.4375")
         self.assertEqual(lib.normalize_doi("10.7717/peerj.4375"), "10.7717/peerj.4375")
         self.assertEqual(
             lib.normalize_doi("https://doi.org/10.1038/nature11018"),
