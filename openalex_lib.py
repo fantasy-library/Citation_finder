@@ -36,10 +36,9 @@ OPENALEX_WORK_SELECT = ",".join(
         "primary_topic",
         "topics",
         "authorships",
-        "authors_count",
         "countries_distinct_count",
         "ids",
-        "grants",
+        "awards",
         "is_retracted",
         "sustainable_development_goals",
     ]
@@ -141,6 +140,18 @@ def sdg_labels_from_work(work: Optional[Dict[str, Any]]) -> List[str]:
     return [label for _, label in scored]
 
 
+def _openalex_error_detail(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            msg = payload.get("message") or payload.get("error")
+            if msg:
+                return str(msg)[:200]
+    except ValueError:
+        pass
+    return (response.text or "")[:200]
+
+
 def get_openalex_work_by_doi(
     doi: str,
     api_key: str = "",
@@ -171,8 +182,20 @@ def get_openalex_work_by_doi(
             return None, "OpenAlex rate limit (429); retry later or add a free API key"
         if response.status_code in (401, 403):
             return None, f"OpenAlex API key rejected ({response.status_code})"
+        if response.status_code == 400 and select:
+            fallback: Dict[str, str] = {}
+            if key:
+                fallback["api_key"] = key
+            response_fb = _SESSION.get(url, params=fallback or None, timeout=REQUEST_TIMEOUT)
+            if response_fb.status_code == 200:
+                return response_fb.json(), None
+            detail = _openalex_error_detail(response_fb if response_fb.status_code == 400 else response)
+            return None, f"OpenAlex HTTP 400: {detail}"
+        if response.status_code == 400:
+            return None, f"OpenAlex HTTP 400: {_openalex_error_detail(response)}"
         if response.status_code != 200:
-            return None, f"OpenAlex HTTP {response.status_code}"
+            detail = _openalex_error_detail(response)
+            return None, f"OpenAlex HTTP {response.status_code}: {detail}"
         return response.json(), None
     except requests.RequestException as exc:
         return None, f"OpenAlex request failed: {str(exc)[:100]}"
@@ -272,15 +295,15 @@ def format_topics_summary(work: Dict[str, Any]) -> Dict[str, str]:
 
 
 def format_grants_summary(work: Dict[str, Any]) -> str:
-    grants = work.get("grants") or []
+    grants = work.get("awards") or work.get("grants") or []
     if not isinstance(grants, list) or not grants:
         return "N/A"
     parts: List[str] = []
     for g in grants:
         if not isinstance(g, dict):
             continue
-        funder = (g.get("funder_display_name") or "").strip()
-        award = (g.get("award_id") or "").strip()
+        funder = (g.get("funder_display_name") or g.get("display_name") or "").strip()
+        award = (g.get("award_id") or g.get("id") or "").strip()
         if funder and award:
             parts.append(f"{funder} ({award})")
         elif funder:

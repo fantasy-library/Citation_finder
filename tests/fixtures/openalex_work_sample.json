@@ -46,13 +46,12 @@
       ]
     }
   ],
-  "authors_count": 2,
   "countries_distinct_count": 2,
   "ids": {
     "pmid": "https://pubmed.ncbi.nlm.nih.gov/25505056",
     "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4275199"
   },
-  "grants": [
+  "awards": [
     {
       "funder_display_name": "National Science Foundation",
       "award_id": "ABI 1661218"
